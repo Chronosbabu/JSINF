@@ -1,28 +1,147 @@
 {% extends "base.html" %}
 
+{% block styles %}
+<style>
+    .upload-container {
+        background: white;
+        max-width: 700px;
+        margin: 40px auto;
+        padding: 50px 40px;
+        border-radius: 20px;
+        box-shadow: 0 15px 40px rgba(0,0,0,0.1);
+    }
+    .upload-container h1 {
+        text-align: center;
+        margin-bottom: 40px;
+        color: #2c3e50;
+        font-size: 2.2rem;
+    }
+    .form-group {
+        margin-bottom: 25px;
+    }
+    label {
+        display: block;
+        margin-bottom: 8px;
+        font-weight: 600;
+        color: #34495e;
+    }
+    input[type="text"], input[type="number"], textarea {
+        width: 100%;
+        padding: 14px 16px;
+        border: 2px solid #ddd;
+        border-radius: 10px;
+        font-size: 1.05rem;
+        transition: all 0.3s;
+    }
+    input:focus, textarea:focus {
+        border-color: #3498db;
+        outline: none;
+        box-shadow: 0 0 0 4px rgba(52, 152, 219, 0.15);
+    }
+    textarea {
+        resize: vertical;
+        min-height: 120px;
+    }
+    .radio-group {
+        display: flex;
+        gap: 30px;
+        margin: 15px 0;
+    }
+    .file-input {
+        border: 2px dashed #aaa;
+        padding: 40px;
+        text-align: center;
+        border-radius: 12px;
+        cursor: pointer;
+        transition: all 0.3s;
+    }
+    .file-input:hover {
+        border-color: #3498db;
+        background: #f8fbff;
+    }
+    .submit-btn {
+        width: 100%;
+        padding: 16px;
+        font-size: 1.3rem;
+        background: linear-gradient(135deg, #27ae60, #2ecc71);
+        color: white;
+        border: none;
+        border-radius: 12px;
+        cursor: pointer;
+        margin-top: 20px;
+    }
+    .submit-btn:hover {
+        background: linear-gradient(135deg, #2ecc71, #27ae60);
+        transform: scale(1.02);
+    }
+</style>
+{% endblock %}
+
 {% block content %}
-<h1>Publier un nouveau livre</h1>
+<div class="upload-container">
+    <h1><i class="fas fa-upload"></i> Publier un livre</h1>
 
-<form method="POST" enctype="multipart/form-data">
-    <label>Titre du livre :</label><br>
-    <input type="text" name="title" required style="width:80%; padding:10px; margin:10px 0;"><br>
+    <form method="POST" enctype="multipart/form-data">
+        <div class="form-group">
+            <label>Titre du livre</label>
+            <input type="text" name="title" required placeholder="Ex: Python pour les débutants">
+        </div>
 
-    <label>Numéro WhatsApp (avec indicatif, ex: 243xxxxxxxxx) :</label><br>
-    <input type="text" name="whatsapp" required style="width:80%; padding:10px; margin:10px 0;"><br>
+        <div class="form-group">
+            <label>Numéro WhatsApp (avec indicatif pays)</label>
+            <input type="text" name="whatsapp" required placeholder="243XXXXXXXXX">
+        </div>
 
-    <label>Description :</label><br>
-    <textarea name="description" rows="5" style="width:80%; padding:10px; margin:10px 0;" required></textarea><br>
+        <div class="form-group">
+            <label>Description du livre</label>
+            <textarea name="description" required placeholder="Décrivez brièvement le contenu du livre..."></textarea>
+        </div>
 
-    <label>Type de livre :</label><br>
-    <input type="radio" name="price_type" value="gratuit" checked> Gratuit<br>
-    <input type="radio" name="price_type" value="payant"> Payant 
-    <input type="number" name="price" step="0.01" placeholder="Prix en $" style="width:150px;"><br><br>
+        <div class="form-group">
+            <label>Type de livre</label>
+            <div class="radio-group">
+                <label>
+                    <input type="radio" name="price_type" value="gratuit" checked onchange="togglePrice()">
+                    <strong>Gratuit</strong>
+                </label>
+                <label>
+                    <input type="radio" name="price_type" value="payant" onchange="togglePrice()">
+                    <strong>Payant</strong>
+                </label>
+            </div>
+        </div>
 
-    <label>Sélectionner le fichier (PDF, DOC, DOCX, EPUB) :</label><br>
-    <input type="file" name="file" accept=".pdf,.doc,.docx,.epub" required><br><br>
+        <div class="form-group" id="priceField" style="display: none;">
+            <label>Prix en dollars ($)</label>
+            <input type="number" name="price" step="0.01" placeholder="Ex: 9.99" min="0">
+        </div>
 
-    <button type="submit" style="background:#28a745; color:white; padding:12px 30px; font-size:1.1em;">Publier le livre</button>
-</form>
+        <div class="form-group">
+            <label>Fichier du livre</label>
+            <div class="file-input" onclick="document.getElementById('file').click()">
+                <i class="fas fa-cloud-upload-alt" style="font-size: 3rem; color: #3498db; margin-bottom: 10px;"></i>
+                <p>Cliquez ici pour sélectionner un fichier</p>
+                <small>PDF, DOC, DOCX, EPUB (max 50 Mo)</small>
+            </div>
+            <input type="file" id="file" name="file" accept=".pdf,.doc,.docx,.epub" required style="display: none;">
+        </div>
 
-<a href="{{ url_for('home') }}">← Retour à l'accueil</a>
+        <button type="submit" class="submit-btn">
+            <i class="fas fa-paper-plane"></i> Publier le livre maintenant
+        </button>
+    </form>
+
+    <div style="text-align: center; margin-top: 25px;">
+        <a href="{{ url_for('home') }}" style="color: #3498db; text-decoration: none;">
+            ← Retour à l'accueil
+        </a>
+    </div>
+</div>
+
+<script>
+function togglePrice() {
+    const payant = document.querySelector('input[value="payant"]:checked');
+    document.getElementById('priceField').style.display = payant ? 'block' : 'none';
+}
+</script>
 {% endblock %}
