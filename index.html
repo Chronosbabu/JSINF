@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<title>JSINF - Bibliothèque</title>
+
+<style>
+body {
+    font-family: Arial;
+    background: #f4f4f4;
+    text-align: center;
+}
+
+h1 {
+    color: #333;
+}
+
+input {
+    padding: 10px;
+    width: 60%;
+    margin: 20px;
+}
+
+.book {
+    background: white;
+    padding: 15px;
+    margin: 10px auto;
+    width: 60%;
+    border-radius: 10px;
+    box-shadow: 0 0 10px rgba(0,0,0,0.1);
+}
+
+button {
+    padding: 10px;
+    background: green;
+    color: white;
+    border: none;
+    cursor: pointer;
+}
+</style>
+</head>
+
+<body>
+
+<h1>Recherche de livres JSINF</h1>
+
+<input type="text" placeholder="Rechercher un livre..." onkeyup="searchBook()">
+
+<div class="book">
+    <h3>Exemple Livre</h3>
+    <p>Petit aperçu du contenu du livre...</p>
+
+    <a href="https://wa.me/243XXXXXXXXX" target="_blank">
+        <button>Contacter sur WhatsApp</button>
+    </a>
+</div>
+
+<script>
+function searchBook() {
+    let input = document.querySelector("input").value.toLowerCase();
+    let books = document.querySelectorAll(".book");
+
+    books.forEach(book => {
+        let title = book.querySelector("h3").innerText.toLowerCase();
+        book.style.display = title.includes(input) ? "block" : "none";
+    });
+}
+</script>
+
+</body>
+</html>
