@@ -1,71 +1,42 @@
-<!DOCTYPE html>
-<html lang="fr">
-<head>
-<meta charset="UTF-8">
-<title>JSINF - Bibliothèque</title>
+{% extends "base.html" %}
 
-<style>
-body {
-    font-family: Arial;
-    background: #f4f4f4;
-    text-align: center;
-}
+{% block content %}
+<h1>📚 JSINF - Bibliothèque</h1>
 
-h1 {
-    color: #333;
-}
+<a href="{{ url_for('upload') }}"><button class="btn-upload">+ Publier un nouveau livre</button></a>
 
-input {
-    padding: 10px;
-    width: 60%;
-    margin: 20px;
-}
+<input type="text" class="search-bar" id="searchInput" placeholder="Rechercher un livre..." onkeyup="searchBooks()">
 
-.book {
-    background: white;
-    padding: 15px;
-    margin: 10px auto;
-    width: 60%;
-    border-radius: 10px;
-    box-shadow: 0 0 10px rgba(0,0,0,0.1);
-}
+{% for book in books %}
+<div class="book" data-title="{{ book.title }}">
+    <h3>{{ book.title }}</h3>
+    <p><strong>Description :</strong> {{ book.description }}</p>
+    <p><strong>Date :</strong> {{ book.date }}</p>
+    
+    {% if book.price_type == 'gratuit' %}
+        <p><strong style="color:green;">✅ Gratuit</strong></p>
+        <a href="{{ url_for('download', book_id=book.id) }}">
+            <button class="btn btn-download">📥 Télécharger</button>
+        </a>
+    {% else %}
+        <p><strong style="color:#d32f2f;">💰 Payant - {{ book.price }} $</strong></p>
+    {% endif %}
 
-button {
-    padding: 10px;
-    background: green;
-    color: white;
-    border: none;
-    cursor: pointer;
-}
-</style>
-</head>
-
-<body>
-
-<h1>Recherche de livres JSINF</h1>
-
-<input type="text" placeholder="Rechercher un livre..." onkeyup="searchBook()">
-
-<div class="book">
-    <h3>Exemple Livre</h3>
-    <p>Petit aperçu du contenu du livre...</p>
-
-    <a href="https://wa.me/243XXXXXXXXX" target="_blank">
-        <button>Contacter sur WhatsApp</button>
+    <a href="https://wa.me/{{ book.whatsapp }}" target="_blank">
+        <button class="btn btn-whatsapp">💬 Contacter sur WhatsApp</button>
     </a>
 </div>
+{% endfor %}
 
 <script>
-function searchBook() {
-    let input = document.querySelector("input").value.toLowerCase();
+function searchBooks() {
+    let input = document.getElementById("searchInput").value.toLowerCase();
     let books = document.querySelectorAll(".book");
 
     books.forEach(book => {
-        let title = book.querySelector("h3").innerText.toLowerCase();
+        let title = book.getAttribute("data-title").toLowerCase();
         book.style.display = title.includes(input) ? "block" : "none";
     });
 }
 </script>
-
-</body>
-</html>
+{% endblock %}
