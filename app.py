@@ -17,7 +17,6 @@ def backup():
         if not school_code or not backup_data:
             return jsonify({"error": "Données invalides"}), 400
 
-        # Extraction du mot de passe (s'il existe)
         backup_password = backup_data.get('backup_password')
 
         filename = f"{school_code.lower()}.json"
@@ -49,15 +48,14 @@ def restore():
         with open(filepath, 'r', encoding='utf-8') as f:
             data = json.load(f)
         
-        # On retire le mot de passe de la réponse pour plus de sécurité (optionnel)
-        # data.pop('backup_password', None)   # Décommente si tu veux cacher le mdp
+        # On retire le mot de passe de la réponse pour plus de sécurité
+        data.pop('backup_password', None)
 
         return jsonify(data), 200
     else:
         return jsonify({"error": "Aucune sauvegarde trouvée pour ce code"}), 404
 
 
-# Optionnel : Route pour vérifier uniquement le mot de passe (plus sécurisé à l'avenir)
 @app.route('/verify_password', methods=['POST'])
 def verify_password():
     try:
