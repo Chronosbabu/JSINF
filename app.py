@@ -3,41 +3,33 @@ import json
 import os
 
 app = Flask(__name__)
-
 DATA_DIR = "school_data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
+# ==================== NOUVELLE FONCTIONNALITÉ MULTI-SECTION ====================
 @app.route('/backup', methods=['POST'])
 def backup():
     try:
         data = request.get_json()
         school_code = data.get('school_code')
         backup_data = data.get('data')
-
         if not school_code or not backup_data:
             return jsonify({"error": "Données invalides"}), 400
 
         backup_password = backup_data.get('backup_password')
-
         filename = f"{school_code.lower()}.json"
         filepath = os.path.join(DATA_DIR, filename)
 
         with open(filepath, 'w', encoding='utf-8') as f:
             json.dump(backup_data, f, ensure_ascii=False, indent=2)
 
-        return jsonify({
-            "message": "Sauvegarde réussie",
-            "school_code": school_code
-        }), 200
-
+        return jsonify({"message": "Sauvegarde réussie", "school_code": school_code}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
 
 @app.route('/restore', methods=['GET'])
 def restore():
     school_code = request.args.get('school_code')
-    
     if not school_code:
         return jsonify({"error": "Code manquant"}), 400
 
@@ -47,14 +39,10 @@ def restore():
     if os.path.exists(filepath):
         with open(filepath, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        
-        # On retire le mot de passe de la réponse pour plus de sécurité
         data.pop('backup_password', None)
-
         return jsonify(data), 200
     else:
         return jsonify({"error": "Aucune sauvegarde trouvée pour ce code"}), 404
-
 
 @app.route('/verify_password', methods=['POST'])
 def verify_password():
@@ -62,7 +50,6 @@ def verify_password():
         data = request.get_json()
         school_code = data.get('school_code')
         password = data.get('password')
-
         if not school_code or not password:
             return jsonify({"error": "Données manquantes"}), 400
 
@@ -72,7 +59,6 @@ def verify_password():
         if os.path.exists(filepath):
             with open(filepath, 'r', encoding='utf-8') as f:
                 saved_data = json.load(f)
-            
             saved_password = saved_data.get('backup_password')
             if saved_password == password:
                 return jsonify({"valid": True}), 200
@@ -80,10 +66,23 @@ def verify_password():
                 return jsonify({"valid": False, "error": "Mot de passe incorrect"}), 401
         else:
             return jsonify({"error": "Aucune sauvegarde trouvée"}), 404
-
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# ==================== NOUVELLE ROUTE POUR CLÉS PAR SECTION ====================
+@app.route('/generate_key', methods=['POST'])
+def generate_key():
+    try:
+        data = request.get_json()
+        school_code = data.get('school_code')
+        section = data.get('section')  # ex: "Primaire", "Secondaire", "Maternelle"
+        if not school_code or not section:
+            return jsonify({"error": "Données manquantes"}), 400
+
+        key = f"{school_code.upper()}_{section.upper()[:3]}_{os.urandom(4).hex()}"
+        return jsonify({"key": key, "section": section}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=10000)
