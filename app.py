@@ -7,18 +7,16 @@ app = Flask(__name__)
 DATA_DIR = "school_data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
-KEYS_FILE = os.path.join(DATA_DIR, "keys_store.json")
-IDS_FILE = os.path.join(DATA_DIR, "ids_store.json")
-PENDING_FILE = os.path.join(DATA_DIR, "pending_payments.json")  # Nouveau fichier pour suivi
+PENDING_FILE = os.path.join(DATA_DIR, "pending_payments.json")
 
-def _load_json(path, default):
-    if os.path.exists(path):
-        with open(path, 'r', encoding='utf-8') as f:
+def _load_pending():
+    if os.path.exists(PENDING_FILE):
+        with open(PENDING_FILE, 'r', encoding='utf-8') as f:
             return json.load(f)
-    return default
+    return {}
 
-def _save_json(path, data):
-    with open(path, 'w', encoding='utf-8') as f:
+def _save_pending(data):
+    with open(PENDING_FILE, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 # ==================== BACKUP / RESTORE ====================
@@ -51,21 +49,58 @@ def restore():
         data.pop('backup_password', None)
         return jsonify(data), 200
     else:
-        return jsonify({"error": "Aucune sauvegarde trouvée pour ce code"}), 404
+        return jsonify({"error": "Aucune sauvegarde trouvée"}), 404
 
-# ==================== PAIEMENT (AMÉLIORÉ) ====================
+# ==================== ENREGISTREMENT PAIEMENT EN ATTENTE ====================
 @app.route('/record_payment', methods=['POST'])
 def record_payment():
     try:
         data = request.get_json()
         school_code = data.get('school_code')
-        annee = data.get('annee')
         eleve_id = data.get('eleve_id')
         mois = data.get('mois')
         amount = data.get('amount')
 
-        if not all([school_code, annee, eleve_id, mois]) or amount is None:
+        if not all([school_code, eleve_id, mois, amount]):
             return jsonify({"error": "Données manquantes"}), 400
+
+        pending = _load_pending()
+        key = school_code.lower()
+        if key not in pending:
+            pending[key] = []
+
+        pending[key].append({
+            "eleve_id": eleve_id,
+            "mois": mois,
+            "amount": amount,
+            "date": datetime.datetime.now().isoformat(),
+            "status": "pending"
+        })
+
+        _save_pending(pending)
+        return jsonify({"message": "Paiement envoyé en attente de validation"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ==================== RÉCUPÉRATION PAIEMENTS EN ATTENTE POUR ADMIN ====================
+@app.route('/pending_payments', methods=['GET'])
+def pending_payments():
+    school_code = request.args.get('school_code')
+    if not school_code:
+        return jsonify({"error": "Code manquant"}), 400
+
+    pending = _load_pending()
+    key = school_code.lower()
+    return jsonify(pending.get(key, [])), 200
+
+# ==================== VALIDATION DES PAIEMENTS PAR ADMIN ====================
+@app.route('/validate_payments', methods=['POST'])
+def validate_payments():
+    try:
+        data = request.get_json()
+        school_code = data.get('school_code')
+        if not school_code:
+            return jsonify({"error": "Code manquant"}), 400
 
         filename = f"{school_code.lower()}.json"
         filepath = os.path.join(DATA_DIR, filename)
@@ -73,167 +108,36 @@ def record_payment():
             return jsonify({"error": "École introuvable"}), 404
 
         with open(filepath, 'r', encoding='utf-8') as f:
-            saved = json.load(f)
+            school_data = json.load(f)
 
-        history = saved.get('history', {})
-        year_data = history.get(annee)
-        if not year_data:
-            return jsonify({"error": "Année introuvable"}), 404
+        pending = _load_pending()
+        key = school_code.lower()
+        payments = pending.get(key, [])
 
-        eleve = None
-        for e in year_data.get('eleves', []):
-            if e.get('id') == eleve_id:
-                eleve = e
-                break
-
-        if eleve is None:
-            return jsonify({"error": "Élève introuvable"}), 404
-
-        # Mise à jour du paiement
-        eleve.setdefault('paid', {})
-        eleve['paid'][mois] = eleve['paid'].get(mois, 0) + amount
-
-        eleve.setdefault('transactions', [])
-        eleve['transactions'].append({
-            'date': datetime.date.today().isoformat(),
-            'mois': mois,
-            'amount': amount,
-            'from_subuser': True
-        })
+        # Appliquer les paiements
+        for p in payments:
+            for year_data in school_data.get('history', {}).values():
+                for eleve in year_data.get('eleves', []):
+                    if eleve.get('id') == p['eleve_id']:
+                        eleve.setdefault('paid', {})
+                        eleve['paid'][p['mois']] = eleve['paid'].get(p['mois'], 0) + p['amount']
+                        eleve.setdefault('transactions', [])
+                        eleve['transactions'].append({
+                            'date': p['date'],
+                            'mois': p['mois'],
+                            'amount': p['amount'],
+                            'validated_by_admin': True
+                        })
 
         with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(saved, f, ensure_ascii=False, indent=2)
+            json.dump(school_data, f, ensure_ascii=False, indent=2)
 
-        return jsonify({
-            "message": "Paiement enregistré avec succès",
-            "paid_total": eleve['paid'][mois]
-        }), 200
+        # Vider les paiements validés
+        if key in pending:
+            del pending[key]
+            _save_pending(pending)
 
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-# ==================== AUTRES ROUTES (inchangées) ====================
-@app.route('/verify_password', methods=['POST'])
-def verify_password():
-    try:
-        data = request.get_json()
-        school_code = data.get('school_code')
-        password = data.get('password')
-        if not school_code or not password:
-            return jsonify({"error": "Données manquantes"}), 400
-        filename = f"{school_code.lower()}.json"
-        filepath = os.path.join(DATA_DIR, filename)
-        if os.path.exists(filepath):
-            with open(filepath, 'r', encoding='utf-8') as f:
-                saved_data = json.load(f)
-            saved_password = saved_data.get('backup_password')
-            if saved_password == password:
-                return jsonify({"valid": True}), 200
-            else:
-                return jsonify({"valid": False, "error": "Mot de passe incorrect"}), 401
-        else:
-            return jsonify({"error": "Aucune sauvegarde trouvée"}), 404
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/generate_key', methods=['POST'])
-def generate_key():
-    try:
-        data = request.get_json()
-        school_code = data.get('school_code')
-        section = data.get('section')
-        if not school_code or not section:
-            return jsonify({"error": "Données manquantes"}), 400
-
-        key = f"{school_code.upper()}*{section.upper()[:3]}*{os.urandom(4).hex()}"
-        keys = _load_json(KEYS_FILE, {})
-        keys[key] = {"school_code": school_code, "section": section}
-        _save_json(KEYS_FILE, keys)
-
-        return jsonify({"key": key, "section": section}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/verify_key', methods=['POST'])
-def verify_key():
-    try:
-        data = request.get_json()
-        key = data.get('key')
-        if not key:
-            return jsonify({"valid": False, "error": "Clé manquante"}), 400
-
-        keys = _load_json(KEYS_FILE, {})
-        info = keys.get(key)
-        if not info:
-            return jsonify({"valid": False, "error": "Clé invalide"}), 404
-
-        school_code = info["school_code"]
-        filename = f"{school_code.lower()}.json"
-        filepath = os.path.join(DATA_DIR, filename)
-        school_name = school_code
-        current_year = None
-        if os.path.exists(filepath):
-            with open(filepath, 'r', encoding='utf-8') as f:
-                saved = json.load(f)
-            school_name = saved.get('config', {}).get('schoolName', school_code)
-            current_year = saved.get('currentYear')
-
-        return jsonify({
-            "valid": True,
-            "school_code": school_code,
-            "section": info["section"],
-            "school_name": school_name,
-            "current_year": current_year,
-        }), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/revoke_key', methods=['POST'])
-def revoke_key():
-    try:
-        data = request.get_json()
-        key = data.get('key')
-        if not key:
-            return jsonify({"error": "Clé manquante"}), 400
-        keys = _load_json(KEYS_FILE, {})
-        if key in keys:
-            del keys[key]
-            _save_json(KEYS_FILE, keys)
-        return jsonify({"message": "Clé révoquée"}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/generate_student_id', methods=['POST'])
-def generate_student_id():
-    try:
-        data = request.get_json()
-        school_code = data.get('school_code')
-        school_name = data.get('school_name', '')
-        nom = data.get('nom', '')
-        year = data.get('year', '2025-2026')
-
-        if not school_code or not nom:
-            return jsonify({"error": "Données manquantes"}), 400
-
-        year_short = year[-2:] if len(year) >= 2 else "26"
-        school_letter = school_name[0].upper() if school_name else "B"
-        name_prefix = nom.strip()[:2].upper() if nom.strip() else "XX"
-        base_id = f"{name_prefix}{year_short}{school_letter}"
-
-        ids_store = _load_json(IDS_FILE, {})
-        used_ids = set(ids_store.get(school_code.lower(), []))
-
-        counter = 1
-        candidate = f"{base_id}{counter}"
-        while candidate in used_ids:
-            counter += 1
-            candidate = f"{base_id}{counter}"
-
-        used_ids.add(candidate)
-        ids_store[school_code.lower()] = list(used_ids)
-        _save_json(IDS_FILE, ids_store)
-
-        return jsonify({"id": candidate}), 200
+        return jsonify({"message": "Tous les paiements validés et enregistrés"}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
