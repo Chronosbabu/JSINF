@@ -9,6 +9,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 KEYS_FILE = os.path.join(DATA_DIR, "keys_store.json")
 IDS_FILE = os.path.join(DATA_DIR, "ids_store.json")
+PENDING_FILE = os.path.join(DATA_DIR, "pending_payments.json")  # Nouveau fichier pour suivi
 
 def _load_json(path, default):
     if os.path.exists(path):
@@ -52,6 +53,66 @@ def restore():
     else:
         return jsonify({"error": "Aucune sauvegarde trouvée pour ce code"}), 404
 
+# ==================== PAIEMENT (AMÉLIORÉ) ====================
+@app.route('/record_payment', methods=['POST'])
+def record_payment():
+    try:
+        data = request.get_json()
+        school_code = data.get('school_code')
+        annee = data.get('annee')
+        eleve_id = data.get('eleve_id')
+        mois = data.get('mois')
+        amount = data.get('amount')
+
+        if not all([school_code, annee, eleve_id, mois]) or amount is None:
+            return jsonify({"error": "Données manquantes"}), 400
+
+        filename = f"{school_code.lower()}.json"
+        filepath = os.path.join(DATA_DIR, filename)
+        if not os.path.exists(filepath):
+            return jsonify({"error": "École introuvable"}), 404
+
+        with open(filepath, 'r', encoding='utf-8') as f:
+            saved = json.load(f)
+
+        history = saved.get('history', {})
+        year_data = history.get(annee)
+        if not year_data:
+            return jsonify({"error": "Année introuvable"}), 404
+
+        eleve = None
+        for e in year_data.get('eleves', []):
+            if e.get('id') == eleve_id:
+                eleve = e
+                break
+
+        if eleve is None:
+            return jsonify({"error": "Élève introuvable"}), 404
+
+        # Mise à jour du paiement
+        eleve.setdefault('paid', {})
+        eleve['paid'][mois] = eleve['paid'].get(mois, 0) + amount
+
+        eleve.setdefault('transactions', [])
+        eleve['transactions'].append({
+            'date': datetime.date.today().isoformat(),
+            'mois': mois,
+            'amount': amount,
+            'from_subuser': True
+        })
+
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(saved, f, ensure_ascii=False, indent=2)
+
+        return jsonify({
+            "message": "Paiement enregistré avec succès",
+            "paid_total": eleve['paid'][mois]
+        }), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ==================== AUTRES ROUTES (inchangées) ====================
 @app.route('/verify_password', methods=['POST'])
 def verify_password():
     try:
@@ -75,7 +136,6 @@ def verify_password():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ==================== CLÉS D'ACCÈS ====================
 @app.route('/generate_key', methods=['POST'])
 def generate_key():
     try:
@@ -143,7 +203,6 @@ def revoke_key():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ==================== GÉNÉRATION ID ====================
 @app.route('/generate_student_id', methods=['POST'])
 def generate_student_id():
     try:
@@ -175,58 +234,6 @@ def generate_student_id():
         _save_json(IDS_FILE, ids_store)
 
         return jsonify({"id": candidate}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-# ==================== PAIEMENT ====================
-@app.route('/record_payment', methods=['POST'])
-def record_payment():
-    try:
-        data = request.get_json()
-        school_code = data.get('school_code')
-        annee = data.get('annee')
-        eleve_id = data.get('eleve_id')
-        mois = data.get('mois')
-        amount = data.get('amount')
-
-        if not all([school_code, annee, eleve_id, mois]) or amount is None:
-            return jsonify({"error": "Données manquantes"}), 400
-
-        filename = f"{school_code.lower()}.json"
-        filepath = os.path.join(DATA_DIR, filename)
-        if not os.path.exists(filepath):
-            return jsonify({"error": "École introuvable"}), 404
-
-        with open(filepath, 'r', encoding='utf-8') as f:
-            saved = json.load(f)
-
-        history = saved.get('history', {})
-        year_data = history.get(annee)
-        if not year_data:
-            return jsonify({"error": "Année introuvable"}), 404
-
-        eleve = None
-        for e in year_data.get('eleves', []):
-            if e.get('id') == eleve_id:
-                eleve = e
-                break
-
-        if eleve is None:
-            return jsonify({"error": "Élève introuvable"}), 404
-
-        eleve.setdefault('paid', {})
-        eleve['paid'][mois] = eleve['paid'].get(mois, 0) + amount
-        eleve.setdefault('transactions', [])
-        eleve['transactions'].append({
-            'date': datetime.date.today().isoformat(),
-            'mois': mois,
-            'amount': amount,
-        })
-
-        with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(saved, f, ensure_ascii=False, indent=2)
-
-        return jsonify({"message": "Paiement enregistré", "paid_total": eleve['paid'][mois]}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
