@@ -10,18 +10,15 @@ os.makedirs(DATA_DIR, exist_ok=True)
 KEYS_FILE = os.path.join(DATA_DIR, "keys_store.json")
 IDS_FILE = os.path.join(DATA_DIR, "ids_store.json")
 
-
 def _load_json(path, default):
     if os.path.exists(path):
         with open(path, 'r', encoding='utf-8') as f:
             return json.load(f)
     return default
 
-
 def _save_json(path, data):
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
-
 
 # ==================== BACKUP / RESTORE ====================
 @app.route('/backup', methods=['POST'])
@@ -40,7 +37,6 @@ def backup():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-
 @app.route('/restore', methods=['GET'])
 def restore():
     school_code = request.args.get('school_code')
@@ -55,7 +51,6 @@ def restore():
         return jsonify(data), 200
     else:
         return jsonify({"error": "Aucune sauvegarde trouvée pour ce code"}), 404
-
 
 @app.route('/verify_password', methods=['POST'])
 def verify_password():
@@ -80,22 +75,17 @@ def verify_password():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-
-# ==================== CLÉS D'ACCÈS PAR SECTION (sub-users) ====================
-# Avant : la clé était juste renvoyée sans jamais être enregistrée -> impossible
-# de la vérifier ensuite. Maintenant le serveur la stocke et c'est LUI seul
-# qui sait si une clé est valide.
+# ==================== CLÉS D'ACCÈS ====================
 @app.route('/generate_key', methods=['POST'])
 def generate_key():
     try:
         data = request.get_json()
         school_code = data.get('school_code')
-        section = data.get('section')  # ex: "Primaire", "Secondaire", "Maternelle"
+        section = data.get('section')
         if not school_code or not section:
             return jsonify({"error": "Données manquantes"}), 400
 
         key = f"{school_code.upper()}*{section.upper()[:3]}*{os.urandom(4).hex()}"
-
         keys = _load_json(KEYS_FILE, {})
         keys[key] = {"school_code": school_code, "section": section}
         _save_json(KEYS_FILE, keys)
@@ -104,13 +94,8 @@ def generate_key():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-
 @app.route('/verify_key', methods=['POST'])
 def verify_key():
-    """Le sub-user appelle cette route à la connexion. Si la clé n'existe pas
-    dans keys_store.json (donc n'a pas été générée par ce serveur), c'est
-    refusé. On renvoie aussi le nom de l'école et l'année en cours de l'admin,
-    pour que le sub-user charge directement les bonnes données."""
     try:
         data = request.get_json()
         key = data.get('key')
@@ -143,7 +128,6 @@ def verify_key():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-
 @app.route('/revoke_key', methods=['POST'])
 def revoke_key():
     try:
@@ -159,11 +143,7 @@ def revoke_key():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-
-# ==================== GÉNÉRATION D'ID ÉLÈVE (toujours côté serveur) ====================
-# Avant : l'ID était calculé en local dans l'app Flutter, donc créé même
-# sans internet. Maintenant c'est le serveur qui décide et qui garde la trace
-# des IDs déjà utilisés pour chaque école, pour garantir l'unicité réelle.
+# ==================== GÉNÉRATION ID ====================
 @app.route('/generate_student_id', methods=['POST'])
 def generate_student_id():
     try:
@@ -198,11 +178,7 @@ def generate_student_id():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-
-# ==================== PAIEMENT ENVOYÉ PAR UN SOUS-UTILISATEUR ====================
-# Le sub-user n'a pas de fichier de sauvegarde local partagé avec l'admin :
-# chaque paiement qu'il enregistre est donc poussé directement dans le fichier
-# de sauvegarde de l'école sur le serveur.
+# ==================== PAIEMENT ====================
 @app.route('/record_payment', methods=['POST'])
 def record_payment():
     try:
@@ -253,7 +229,6 @@ def record_payment():
         return jsonify({"message": "Paiement enregistré", "paid_total": eleve['paid'][mois]}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=10000)
