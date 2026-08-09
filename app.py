@@ -16,16 +16,19 @@ PENDING_FILE         = os.path.join(DATA_DIR, "pending_payments.json")
 MOBILE_PAYMENTS_FILE = os.path.join(DATA_DIR, "mobile_payments.json")
 SCHOOLS_FILE         = os.path.join(DATA_DIR, "schools_registry.json")
 
-# Mot de passe administrateur (identique à register_school.py)
 ADMIN_PASSWORD = "edupay_admin_2026"
 
-# Variables Mobile Money (ajoutées plus tard via Render env vars)
 AIRTEL_MERCHANT_ID  = os.environ.get('AIRTEL_MERCHANT_ID', '')
 AIRTEL_API_KEY      = os.environ.get('AIRTEL_API_KEY', '')
 ORANGE_MERCHANT_ID  = os.environ.get('ORANGE_MERCHANT_ID', '')
 ORANGE_API_KEY      = os.environ.get('ORANGE_API_KEY', '')
 VODACOM_MERCHANT_ID = os.environ.get('VODACOM_MERCHANT_ID', '')
 VODACOM_API_KEY     = os.environ.get('VODACOM_API_KEY', '')
+
+MONTHS = [
+    'Septembre', 'Octobre', 'Novembre', 'Decembre',
+    'Janvier', 'Fevrier', 'Mars', 'Avril', 'Mai', 'Juin'
+]
 
 
 def _load_json(path, default):
@@ -41,32 +44,20 @@ def _save_json(path, data):
 
 
 def _generate_registration_id():
-    """
-    Génère un ID de connexion unique sécurisé.
-    Format : EDU-XXXX-XXXX-XXXX (lettres majuscules + chiffres)
-    Ex: EDU-A3K9-BZ12-Q7M4
-    """
-    chars = string.ascii_uppercase + string.digits
+    chars  = string.ascii_uppercase + string.digits
     groups = [''.join(secrets.choice(chars) for _ in range(4))
               for _ in range(3)]
     return f"EDU-{'-'.join(groups)}"
 
 
 def _generate_school_code(school_name):
-    """
-    Génère un code école court à partir du nom.
-    Ex: "MAPENDO TCC" → "MAPENDO"
-    """
-    words = school_name.strip().upper().split()
-    base  = words[0][:8] if words else "SCHOOL"
+    words   = school_name.strip().upper().split()
+    base    = words[0][:8] if words else "SCHOOL"
     schools = _load_json(SCHOOLS_FILE, {})
     code    = base
     counter = 1
-    while any(
-        s.get('school_code') == code
-        for s in schools.values()
-    ):
-        code = f"{base}{counter}"
+    while any(s.get('school_code') == code for s in schools.values()):
+        code    = f"{base}{counter}"
         counter += 1
     return code
 
@@ -109,7 +100,7 @@ def _resolve_id_conflicts(school_code, backup_data):
             if eid:
                 own_ids.add(eid)
 
-    all_used  = other_ids | own_ids
+    all_used    = other_ids | own_ids
     corrections = {}
 
     for yd in backup_data.get('history', {}).values():
@@ -119,11 +110,11 @@ def _resolve_id_conflicts(school_code, backup_data):
                 continue
             match = re.match(r'^(.*?)(\d+)$', old_id)
             base  = match.group(1) if match else old_id + '_'
-            counter  = 1
-            new_id   = f"{base}{counter}"
+            counter = 1
+            new_id  = f"{base}{counter}"
             while new_id in all_used:
                 counter += 1
-                new_id = f"{base}{counter}"
+                new_id  = f"{base}{counter}"
             corrections[old_id] = new_id
             e['id'] = new_id
             all_used.add(new_id)
@@ -137,18 +128,61 @@ def mobile_money_available():
 
 
 # ====================================================================
-# ENREGISTREMENT DES ÉCOLES (admin uniquement)
+# DISTRIBUTION MULTI-MOIS (logique identique à handlePayment Flutter)
+# ====================================================================
+def _get_required_for_month(config, section, mois):
+    """
+    Résolution du montant requis pour un mois donné.
+    Priorité : exception par section > frais par section > défaut 35000.
+    """
+    exceptions = config.get('monthlyExceptionsBySection', {}).get(section, {})
+    if mois in exceptions:
+        return float(exceptions[mois])
+    fee = config.get('feesBySection', {}).get(section)
+    if fee is not None:
+        return float(fee)
+    return 35000.0
+
+
+def _distribute_payment(config, eleve, start_mois, total_amount):
+    """
+    Distribue un montant à travers les mois à partir de start_mois,
+    exactement comme handlePayment() dans frais_scolaires.dart.
+    Retourne une liste de {'mois': str, 'amount': float}.
+    """
+    index = MONTHS.index(start_mois) if start_mois in MONTHS else -1
+    if index == -1:
+        return []
+
+    section   = eleve.get('section', '')
+    paid_map  = eleve.get('paid', {})
+    remaining = float(total_amount)
+    entries   = []
+
+    while remaining > 0 and index < len(MONTHS):
+        current_month = MONTHS[index]
+        required      = _get_required_for_month(config, section, current_month)
+        already_paid  = float(paid_map.get(current_month, 0))
+        needed        = required - already_paid
+
+        if needed > 0:
+            to_add    = min(remaining, needed)
+            entries.append({'mois': current_month, 'amount': to_add})
+            remaining -= to_add
+
+        index += 1
+
+    return entries
+
+
+# ====================================================================
+# ENREGISTREMENT DES ÉCOLES
 # ====================================================================
 
 @app.route('/admin/register_school', methods=['POST'])
 def admin_register_school():
-    """
-    Appelé par register_school.py.
-    Enregistre une nouvelle école et génère son ID de connexion unique.
-    """
     try:
         data = request.get_json()
-
         if data.get('admin_password') != ADMIN_PASSWORD:
             return jsonify({"error": "Mot de passe admin incorrect"}), 401
 
@@ -171,26 +205,25 @@ def admin_register_school():
         school_code = _generate_school_code(school_name)
         reg_id      = _generate_registration_id()
 
-        # S'assurer que l'ID est vraiment unique
         all_reg_ids = {s.get('registration_id') for s in schools.values()}
         while reg_id in all_reg_ids:
             reg_id = _generate_registration_id()
 
         schools[school_code] = {
-            "school_code":      school_code,
-            "school_name":      school_name,
-            "city":             city,
-            "address":          address,
-            "director":         director,
-            "phone":            phone,
-            "email":            email,
-            "bank_name":        bank_name,
-            "bank_account":     bank_account,
-            "bank_branch":      bank_branch,
-            "registration_id":  reg_id,
-            "activated":        False,   # devient True après 1ère connexion
-            "registered_at":    datetime.datetime.now().isoformat(),
-            "activated_at":     None,
+            "school_code":     school_code,
+            "school_name":     school_name,
+            "city":            city,
+            "address":         address,
+            "director":        director,
+            "phone":           phone,
+            "email":           email,
+            "bank_name":       bank_name,
+            "bank_account":    bank_account,
+            "bank_branch":     bank_branch,
+            "registration_id": reg_id,
+            "activated":       False,
+            "registered_at":   datetime.datetime.now().isoformat(),
+            "activated_at":    None,
         }
         _save_json(SCHOOLS_FILE, schools)
 
@@ -200,39 +233,29 @@ def admin_register_school():
             "school_name":     school_name,
             "registration_id": reg_id,
         }), 200
-
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 @app.route('/school/verify_registration_id', methods=['POST'])
 def verify_registration_id():
-    """
-    L'application Flutter appelle cette route quand l'école
-    entre son ID de connexion pour la première fois.
-    Retourne les infos de l'école si l'ID est valide et non encore utilisé.
-    """
     try:
         data   = request.get_json()
         reg_id = data.get('registration_id', '').strip().upper()
-
         if not reg_id:
-            return jsonify({
-                "valid": False,
-                "error": "ID manquant"
-            }), 400
+            return jsonify({"valid": False, "error": "ID manquant"}), 400
 
         schools = _load_json(SCHOOLS_FILE, {})
-
         for school_code, school in schools.items():
             if school.get('registration_id', '').upper() == reg_id:
                 if school.get('activated'):
                     return jsonify({
-                        "valid":  False,
-                        "error":  "Cet ID a déjà été utilisé. "
-                                  "Contactez l'administrateur EduPay.",
+                        "valid":       False,
+                        "already_used": True,
+                        "school_code": school_code,
+                        "school_name": school.get('school_name'),
+                        "error":       "Cet ID a déjà été utilisé.",
                     }), 200
-
                 return jsonify({
                     "valid":        True,
                     "school_code":  school_code,
@@ -248,79 +271,92 @@ def verify_registration_id():
             "valid": False,
             "error": "ID invalide. Vérifiez auprès de l'administrateur EduPay.",
         }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
+
+@app.route('/school/get_info_by_reg_id', methods=['POST'])
+def get_info_by_reg_id():
+    """
+    ⚡ NOUVEAU — Retourne le vrai school_code d'une école à partir
+    de son registration_id, même si elle est déjà activée.
+    Utilisé par recovery_screen.dart pour corriger le bug du login
+    sur Windows (l'ID de registration était utilisé comme school_code).
+    """
+    try:
+        data   = request.get_json()
+        reg_id = data.get('registration_id', '').strip().upper()
+        if not reg_id:
+            return jsonify({"found": False}), 400
+
+        schools = _load_json(SCHOOLS_FILE, {})
+        for school_code, school in schools.items():
+            if school.get('registration_id', '').upper() == reg_id:
+                return jsonify({
+                    "found":        True,
+                    "school_code":  school_code,
+                    "school_name":  school.get('school_name'),
+                    "activated":    school.get('activated', False),
+                }), 200
+
+        return jsonify({"found": False}), 404
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 @app.route('/school/activate', methods=['POST'])
 def activate_school():
-    """
-    Appelée après que l'école a vérifié son ID et défini son mot de passe.
-    Active le compte et marque l'ID comme utilisé (usage unique).
-    Crée le fichier de données initial de l'école sur le serveur.
-    """
     try:
-        data          = request.get_json()
-        reg_id        = data.get('registration_id', '').strip().upper()
-        password      = data.get('password', '').strip()
-        school_name   = data.get('school_name', '').strip()
+        data     = request.get_json()
+        reg_id   = data.get('registration_id', '').strip().upper()
+        password = data.get('password', '').strip()
 
         if not reg_id or not password:
             return jsonify({"error": "Données manquantes"}), 400
 
-        schools = _load_json(SCHOOLS_FILE, {})
-
+        schools     = _load_json(SCHOOLS_FILE, {})
         target_code = None
         for sc, school in schools.items():
             if school.get('registration_id', '').upper() == reg_id:
                 if school.get('activated'):
-                    return jsonify({
-                        "error": "Cet ID a déjà été utilisé."
-                    }), 400
+                    return jsonify({"error": "Cet ID a déjà été utilisé."}), 400
                 target_code = sc
                 break
 
         if not target_code:
             return jsonify({"error": "ID invalide"}), 404
 
-        # Marquer comme activé (usage unique respecté)
         schools[target_code]['activated']    = True
-        schools[target_code]['activated_at'] = (
-            datetime.datetime.now().isoformat()
-        )
+        schools[target_code]['activated_at'] = datetime.datetime.now().isoformat()
         _save_json(SCHOOLS_FILE, schools)
 
-        # Créer le fichier de données initial de l'école
-        school_info  = schools[target_code]
-        final_name   = school_name or school_info.get('school_name', '')
-        filepath     = os.path.join(DATA_DIR, f"{target_code.lower()}.json")
+        school_info = schools[target_code]
+        final_name  = school_info.get('school_name', '')
+        filepath    = os.path.join(DATA_DIR, f"{target_code.lower()}.json")
 
         if not os.path.exists(filepath):
             initial_data = {
                 "config": {
-                    "schoolName":                  final_name,
-                    "sections":                    ["Maternelle", "Primaire", "Secondaire"],
-                    "feesBySection":               {},
-                    "feesByClasse":                {},
-                    "monthlyExceptionsBySection":  {},
-                    "monthlyExceptionsByClasse":   {},
-                    "classesBySection":            {},
-                    "subClassesByClasse":          {},
-                    "administrations":             [],
-                    "bankName":                    school_info.get('bank_name', ''),
-                    "bankAccount":                 school_info.get('bank_account', ''),
-                    "bankBranch":                  school_info.get('bank_branch', ''),
-                    "city":                        school_info.get('city', ''),
-                    "director":                    school_info.get('director', ''),
-                    "phone":                       school_info.get('phone', ''),
-                    "email":                       school_info.get('email', ''),
+                    "schoolName":                 final_name,
+                    "sections":                   ["Maternelle", "Primaire", "Secondaire"],
+                    "feesBySection":              {},
+                    "feesByClasse":               {},
+                    "monthlyExceptionsBySection": {},
+                    "monthlyExceptionsByClasse":  {},
+                    "classesBySection":           {},
+                    "subClassesByClasse":         {},
+                    "administrations":            [],
+                    "bankName":                   school_info.get('bank_name', ''),
+                    "bankAccount":                school_info.get('bank_account', ''),
+                    "bankBranch":                 school_info.get('bank_branch', ''),
+                    "city":                       school_info.get('city', ''),
+                    "director":                   school_info.get('director', ''),
+                    "phone":                      school_info.get('phone', ''),
+                    "email":                      school_info.get('email', ''),
                 },
                 "currentYear":    "2025-2026",
                 "localIdCounter": 0,
-                "history": {
-                    "2025-2026": {"eleves": []}
-                },
+                "history": {"2025-2026": {"eleves": []}},
                 "backup_password": password,
             }
             with open(filepath, 'w', encoding='utf-8') as f:
@@ -331,33 +367,27 @@ def activate_school():
             "school_code": target_code,
             "school_name": final_name,
         }), 200
-
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 @app.route('/admin/list_schools', methods=['POST'])
 def list_schools():
-    """Lister toutes les écoles enregistrées (admin uniquement)."""
     try:
         data = request.get_json()
         if data.get('admin_password') != ADMIN_PASSWORD:
             return jsonify({"error": "Accès refusé"}), 401
-
-        schools  = _load_json(SCHOOLS_FILE, {})
-        summary  = []
-        for sc, s in schools.items():
-            summary.append({
-                "school_code":  sc,
-                "school_name":  s.get('school_name'),
-                "city":         s.get('city'),
-                "director":     s.get('director'),
-                "activated":    s.get('activated', False),
-                "registered_at":s.get('registered_at'),
-                "activated_at": s.get('activated_at'),
-            })
+        schools = _load_json(SCHOOLS_FILE, {})
+        summary = [{
+            "school_code":   sc,
+            "school_name":   s.get('school_name'),
+            "city":          s.get('city'),
+            "director":      s.get('director'),
+            "activated":     s.get('activated', False),
+            "registered_at": s.get('registered_at'),
+            "activated_at":  s.get('activated_at'),
+        } for sc, s in schools.items()]
         return jsonify({"schools": summary, "total": len(summary)}), 200
-
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -412,12 +442,12 @@ def restore():
 @app.route('/record_payment', methods=['POST'])
 def record_payment():
     try:
-        data       = request.get_json()
+        data        = request.get_json()
         school_code = data.get('school_code')
-        annee      = data.get('annee')
-        eleve_id   = data.get('eleve_id')
-        mois       = data.get('mois')
-        amount     = data.get('amount')
+        annee       = data.get('annee')
+        eleve_id    = data.get('eleve_id')
+        mois        = data.get('mois')
+        amount      = data.get('amount')
 
         if not all([school_code, annee, eleve_id, mois]) or amount is None:
             return jsonify({"error": "Données manquantes"}), 400
@@ -435,9 +465,7 @@ def record_payment():
 
         eleve = next(
             (e for e in year_data.get('eleves', [])
-             if e.get('id') == eleve_id),
-            None
-        )
+             if e.get('id') == eleve_id), None)
         if eleve is None:
             return jsonify({"error": "Élève introuvable"}), 404
 
@@ -509,10 +537,8 @@ def validate_payments():
         pending_list  = pending_store.get(school_key, [])
 
         if payment_ids:
-            to_validate = [p for p in pending_list
-                           if p.get('id') in payment_ids]
-            remaining   = [p for p in pending_list
-                           if p.get('id') not in payment_ids]
+            to_validate = [p for p in pending_list if p.get('id') in payment_ids]
+            remaining   = [p for p in pending_list if p.get('id') not in payment_ids]
         else:
             to_validate = pending_list
             remaining   = []
@@ -524,15 +550,12 @@ def validate_payments():
                 continue
             eleve = next(
                 (e for e in year_data.get('eleves', [])
-                 if e.get('id') == entry.get('eleve_id')),
-                None
-            )
+                 if e.get('id') == entry.get('eleve_id')), None)
             if not eleve:
                 continue
             eleve.setdefault('paid', {})
             eleve['paid'][entry['mois']] = (
-                eleve['paid'].get(entry['mois'], 0) + entry['amount']
-            )
+                eleve['paid'].get(entry['mois'], 0) + entry['amount'])
             eleve.setdefault('transactions', [])
             eleve['transactions'].append({
                 'date':         entry.get('date'),
@@ -550,8 +573,8 @@ def validate_payments():
         _save_json(PENDING_FILE, pending_store)
 
         return jsonify({
-            "message":          "Paiements validés",
-            "validated_count":  validated_count,
+            "message":           "Paiements validés",
+            "validated_count":   validated_count,
             "remaining_pending": len(remaining),
         }), 200
     except Exception as e:
@@ -561,17 +584,16 @@ def validate_payments():
 @app.route('/reject_payment', methods=['POST'])
 def reject_payment():
     try:
-        data       = request.get_json()
+        data        = request.get_json()
         school_code = data.get('school_code')
-        payment_id = data.get('payment_id')
+        payment_id  = data.get('payment_id')
         if not school_code or not payment_id:
             return jsonify({"error": "Données manquantes"}), 400
 
         school_key    = school_code.lower()
         pending_store = _load_json(PENDING_FILE, {})
         pending_list  = pending_store.get(school_key, [])
-        pending_list  = [p for p in pending_list
-                         if p.get('id') != payment_id]
+        pending_list  = [p for p in pending_list if p.get('id') != payment_id]
         pending_store[school_key] = pending_list
         _save_json(PENDING_FILE, pending_store)
         return jsonify({"message": "Paiement rejeté"}), 200
@@ -580,7 +602,7 @@ def reject_payment():
 
 
 # ====================================================================
-# PAIEMENTS MOBILE MONEY (parent)
+# PAIEMENTS MOBILE MONEY (parent) — AVEC DISTRIBUTION MULTI-MOIS
 # ====================================================================
 
 @app.route('/payment/status', methods=['GET'])
@@ -639,7 +661,8 @@ def parent_find_student():
                             "school_name":  school_name,
                             "current_year": current_year,
                             "config": {
-                                "feesBySection": config.get('feesBySection', {}),
+                                "feesBySection":
+                                    config.get('feesBySection', {}),
                                 "monthlyExceptionsBySection":
                                     config.get('monthlyExceptionsBySection', {}),
                             }
@@ -675,13 +698,12 @@ def parent_get_payment_history():
         for e in year_data.get('eleves', []):
             if e.get('id', '').upper() == student_id:
                 return jsonify({
-                    "paid":              e.get('paid', {}),
-                    "transactions":      e.get('transactions', []),
-                    "fees_by_section":   config.get('feesBySection', {}),
-                    "monthly_exceptions":
-                        config.get('monthlyExceptionsBySection', {}),
-                    "fees_by_classe":    config.get('feesByClasse', {}),
-                    "current_year":      current_year,
+                    "paid":               e.get('paid', {}),
+                    "transactions":       e.get('transactions', []),
+                    "fees_by_section":    config.get('feesBySection', {}),
+                    "monthly_exceptions": config.get('monthlyExceptionsBySection', {}),
+                    "fees_by_classe":     config.get('feesByClasse', {}),
+                    "current_year":       current_year,
                 }), 200
 
         return jsonify({"error": "Élève introuvable"}), 404
@@ -689,25 +711,21 @@ def parent_get_payment_history():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route('/parent/submit_mobile_payment', methods=['POST'])
-def parent_submit_mobile_payment():
+@app.route('/parent/preview_payment', methods=['POST'])
+def parent_preview_payment():
+    """
+    ⚡ NOUVEAU — Calcule et retourne la distribution multi-mois
+    avant que le parent confirme son paiement.
+    Le parent voit exactement quels mois seront couverts.
+    """
     try:
-        data = request.get_json()
-        return _store_pending_mobile_payment(data)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-def _store_pending_mobile_payment(data):
-    try:
+        data        = request.get_json()
         student_id  = data.get('student_id', '').strip().upper()
         school_code = data.get('school_code', '').strip()
-        mois        = data.get('mois')
-        amount      = data.get('amount')
-        network     = data.get('network', '')
-        parent_name = data.get('parent_name', 'Parent')
+        start_mois  = data.get('start_mois', '')
+        amount      = float(data.get('amount', 0))
 
-        if not all([student_id, school_code, mois]) or amount is None:
+        if not all([student_id, school_code, start_mois]) or amount <= 0:
             return jsonify({"error": "Données manquantes"}), 400
 
         filepath = os.path.join(DATA_DIR, f"{school_code.lower()}.json")
@@ -717,52 +735,138 @@ def _store_pending_mobile_payment(data):
         with open(filepath, 'r', encoding='utf-8') as f:
             saved = json.load(f)
 
+        config       = saved.get('config', {})
         current_year = saved.get('currentYear', '')
         year_data    = saved.get('history', {}).get(current_year, {})
 
         eleve = next(
             (e for e in year_data.get('eleves', [])
-             if e.get('id', '').upper() == student_id),
-            None
-        )
+             if e.get('id', '').upper() == student_id), None)
         if eleve is None:
             return jsonify({"error": "Élève introuvable"}), 404
 
-        mobile_store = _load_json(MOBILE_PAYMENTS_FILE, {})
-        school_key   = school_code.lower()
-        mobile_list  = mobile_store.get(school_key, [])
+        distribution = _distribute_payment(config, eleve, start_mois, amount)
+        total_covered = sum(d['amount'] for d in distribution)
+        remainder     = amount - total_covered  # montant non utilisé (excédent)
 
-        payment_id = (
-            f"mob_{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}"
-            f"_{os.urandom(3).hex()}"
-        )
-        mobile_list.append({
-            "id":          payment_id,
-            "type":        "mobile_money",
-            "eleve_id":    student_id,
-            "annee":       current_year,
-            "nom":         eleve.get('nom', ''),
-            "postNom":     eleve.get('postNom', ''),
-            "prenom":      eleve.get('prenom', ''),
-            "section":     eleve.get('section', ''),
-            "classe":      eleve.get('classe', ''),
-            "mois":        mois,
-            "amount":      amount,
-            "network":     network,
-            "parent_name": parent_name,
-            "date":        datetime.date.today().isoformat(),
-            "status":      "pending",
-            "mode":        "manual",
-        })
+        return jsonify({
+            "distribution": distribution,
+            "total_covered": total_covered,
+            "remainder":     max(0.0, remainder),
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/parent/submit_mobile_payment', methods=['POST'])
+def parent_submit_mobile_payment():
+    """
+    ⚡ CORRIGÉ — Accepte maintenant soit un seul mois, soit une liste
+    de month_entries (distribution multi-mois calculée côté client).
+    Crée une entrée en attente par mois couvert.
+    """
+    try:
+        data = request.get_json()
+        return _store_pending_mobile_payment(data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+def _store_pending_mobile_payment(data):
+    """
+    ⚡ CORRIGÉ — Gère la distribution multi-mois.
+
+    Le client peut envoyer :
+    - Cas A (ancien) : mois + amount → on distribue automatiquement
+    - Cas B (nouveau) : month_entries = [{'mois': ..., 'amount': ...}, ...]
+    """
+    try:
+        student_id    = data.get('student_id', '').strip().upper()
+        school_code   = data.get('school_code', '').strip()
+        network       = data.get('network', '')
+        parent_name   = data.get('parent_name', 'Parent')
+        month_entries = data.get('month_entries')  # Cas B : liste pré-calculée
+        start_mois    = data.get('mois')           # Cas A : mois de départ
+        total_amount  = data.get('amount', 0)
+
+        if not student_id or not school_code:
+            return jsonify({"error": "Données manquantes"}), 400
+
+        filepath = os.path.join(DATA_DIR, f"{school_code.lower()}.json")
+        if not os.path.exists(filepath):
+            return jsonify({"error": "École introuvable"}), 404
+
+        with open(filepath, 'r', encoding='utf-8') as f:
+            saved = json.load(f)
+
+        config       = saved.get('config', {})
+        current_year = saved.get('currentYear', '')
+        year_data    = saved.get('history', {}).get(current_year, {})
+
+        eleve = next(
+            (e for e in year_data.get('eleves', [])
+             if e.get('id', '').upper() == student_id), None)
+        if eleve is None:
+            return jsonify({"error": "Élève introuvable"}), 404
+
+        # Cas A : calculer la distribution si pas déjà fournie
+        if not month_entries:
+            if not start_mois or not total_amount:
+                return jsonify({"error": "Mois et montant requis"}), 400
+            month_entries = _distribute_payment(
+                config, eleve, start_mois, float(total_amount))
+
+        if not month_entries:
+            return jsonify({
+                "error": "Aucune distribution possible "
+                         "(mois déjà payés ou montant nul)"
+            }), 400
+
+        mobile_store  = _load_json(MOBILE_PAYMENTS_FILE, {})
+        school_key    = school_code.lower()
+        mobile_list   = mobile_store.get(school_key, [])
+        today         = datetime.date.today().isoformat()
+        created_ids   = []
+
+        # Créer UNE entrée par mois couvert
+        for entry in month_entries:
+            payment_id = (
+                f"mob_{datetime.datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+                f"_{os.urandom(3).hex()}"
+            )
+            mobile_list.append({
+                "id":          payment_id,
+                "type":        "mobile_money",
+                "eleve_id":    student_id,
+                "annee":       current_year,
+                "nom":         eleve.get('nom', ''),
+                "postNom":     eleve.get('postNom', ''),
+                "prenom":      eleve.get('prenom', ''),
+                "section":     eleve.get('section', ''),
+                "classe":      eleve.get('classe', ''),
+                "mois":        entry['mois'],
+                "amount":      entry['amount'],
+                "network":     network,
+                "parent_name": parent_name,
+                "date":        today,
+                "status":      "pending",
+                "mode":        "manual",
+            })
+            created_ids.append(payment_id)
+
         mobile_store[school_key] = mobile_list
         _save_json(MOBILE_PAYMENTS_FILE, mobile_store)
 
+        total_sent = sum(e['amount'] for e in month_entries)
         return jsonify({
-            "success":    True,
-            "mode":       "manual",
-            "message":    "Demande envoyée. En attente de confirmation par l'école.",
-            "payment_id": payment_id
+            "success":       True,
+            "mode":          "manual",
+            "message":       "Demande envoyée. En attente de confirmation par l'école.",
+            "months_covered": len(month_entries),
+            "total_sent":    total_sent,
+            "payment_ids":   created_ids,
         }), 200
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -806,10 +910,8 @@ def confirm_mobile_payments():
         mobile_list  = mobile_store.get(school_key, [])
 
         if payment_ids:
-            to_confirm = [p for p in mobile_list
-                          if p.get('id') in payment_ids]
-            remaining  = [p for p in mobile_list
-                          if p.get('id') not in payment_ids]
+            to_confirm = [p for p in mobile_list if p.get('id') in payment_ids]
+            remaining  = [p for p in mobile_list if p.get('id') not in payment_ids]
         else:
             to_confirm = mobile_list
             remaining  = []
@@ -822,15 +924,12 @@ def confirm_mobile_payments():
             eleve = next(
                 (e for e in year_data.get('eleves', [])
                  if e.get('id', '').upper() == str(
-                     entry.get('eleve_id', '')).upper()),
-                None
-            )
+                     entry.get('eleve_id', '')).upper()), None)
             if not eleve:
                 continue
             eleve.setdefault('paid', {})
             eleve['paid'][entry['mois']] = (
-                eleve['paid'].get(entry['mois'], 0) + entry['amount']
-            )
+                eleve['paid'].get(entry['mois'], 0) + entry['amount'])
             eleve.setdefault('transactions', [])
             eleve['transactions'].append({
                 'date':        entry.get('date'),
@@ -858,7 +957,7 @@ def confirm_mobile_payments():
 
 
 # ====================================================================
-# WEBHOOKS MOBILE MONEY (à remplir quand les APIs arrivent)
+# WEBHOOKS (à remplir quand les APIs arrivent)
 # ====================================================================
 
 @app.route('/webhook/airtel', methods=['POST'])
@@ -964,8 +1063,8 @@ def generate_key():
             f"{school_code.upper()}*{section.upper()[:3]}"
             f"*{os.urandom(4).hex()}"
         )
-        keys       = _load_json(KEYS_FILE, {})
-        keys[key]  = {"school_code": school_code, "section": section}
+        keys      = _load_json(KEYS_FILE, {})
+        keys[key] = {"school_code": school_code, "section": section}
         _save_json(KEYS_FILE, keys)
         return jsonify({"key": key, "section": section}), 200
     except Exception as e:
@@ -1037,13 +1136,13 @@ def generate_student_id():
         if proposed_id and proposed_id not in used_ids:
             candidate = proposed_id
         else:
-            school_name  = data.get('school_name', '')
-            year_short   = year[-2:] if len(year) >= 2 else "26"
-            school_letter= school_name[0].upper() if school_name else "B"
-            name_prefix  = nom.strip()[:2].upper() if nom.strip() else "XX"
-            base_id      = f"{name_prefix}{year_short}{school_letter}"
-            counter      = 1
-            candidate    = f"{base_id}{counter}"
+            school_name   = data.get('school_name', '')
+            year_short    = year[-2:] if len(year) >= 2 else "26"
+            school_letter = school_name[0].upper() if school_name else "B"
+            name_prefix   = nom.strip()[:2].upper() if nom.strip() else "XX"
+            base_id       = f"{name_prefix}{year_short}{school_letter}"
+            counter       = 1
+            candidate     = f"{base_id}{counter}"
             while candidate in used_ids:
                 counter  += 1
                 candidate = f"{base_id}{counter}"
