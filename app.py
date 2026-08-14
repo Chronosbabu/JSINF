@@ -12,11 +12,14 @@ app = Flask(__name__)
 DATA_DIR = "school_data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
-KEYS_FILE            = os.path.join(DATA_DIR, "keys_store.json")
-IDS_FILE             = os.path.join(DATA_DIR, "ids_store.json")
-PENDING_FILE         = os.path.join(DATA_DIR, "pending_payments.json")
-MOBILE_PAYMENTS_FILE = os.path.join(DATA_DIR, "mobile_payments.json")
-SCHOOLS_FILE         = os.path.join(DATA_DIR, "schools_registry.json")
+KEYS_FILE             = os.path.join(DATA_DIR, "keys_store.json")
+IDS_FILE              = os.path.join(DATA_DIR, "ids_store.json")
+PENDING_FILE          = os.path.join(DATA_DIR, "pending_payments.json")
+MOBILE_PAYMENTS_FILE  = os.path.join(DATA_DIR, "mobile_payments.json")
+SCHOOLS_FILE          = os.path.join(DATA_DIR, "schools_registry.json")
+# ⚡ NOUVEAU — Module Discipline
+ATTENDANCE_FILE       = os.path.join(DATA_DIR, "attendance_records.json")
+MESSAGES_FILE         = os.path.join(DATA_DIR, "parent_messages.json")
 
 ADMIN_PASSWORD = "edupay_admin_2026"
 
@@ -32,12 +35,22 @@ MONTHS = [
     'Janvier', 'Fevrier', 'Mars', 'Avril', 'Mai', 'Juin'
 ]
 
+# ⚡ Liste centrale des fichiers "système" (non-écoles) à exclure de tout
+# scan de dossier qui s'attend à ne trouver que des fichiers école.
+# IMPORTANT : chaque nouveau fichier de stockage global (comme
+# ATTENDANCE_FILE et MESSAGES_FILE ci-dessus) DOIT être ajouté ici,
+# sinon il sera scanné à tort comme un fichier école par parent_find_student,
+# _get_all_ids_except, _auto_confirm_payment, admin_health, etc.
+SYSTEM_FILES = {
+    'keys_store.json', 'ids_store.json',
+    'pending_payments.json', 'mobile_payments.json',
+    'schools_registry.json',
+    'attendance_records.json', 'parent_messages.json',
+}
+
 # ====================================================================
-# ⚡ NOUVEAU — CONFIGURATION DES LOGS
+# ⚡ CONFIGURATION DES LOGS
 # ====================================================================
-# On log sur stdout explicitement : c'est ce que Render capture et
-# affiche dans l'onglet "Logs" de votre service, en temps réel.
-# Format : [HEURE] NIVEAU nom_logger: message
 logging.basicConfig(
     level=logging.INFO,
     format='[%(asctime)s] %(levelname)s %(name)s: %(message)s',
@@ -46,21 +59,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger("edupay")
 
-# ⚡ Log de démarrage : liste le contenu actuel de school_data/.
-# Très utile pour diagnostiquer le problème de stockage éphémère :
-# si ce log montre un dossier VIDE juste après un redémarrage alors
-# que des écoles avaient été sauvegardées avant, c'est la preuve
-# que les données ne survivent pas aux redémarrages du service.
+
 def _log_startup_state():
     try:
         files = os.listdir(DATA_DIR)
         school_files = [
             f for f in files
-            if f.endswith('.json') and f not in {
-                'keys_store.json', 'ids_store.json',
-                'pending_payments.json', 'mobile_payments.json',
-                'schools_registry.json',
-            }
+            if f.endswith('.json') and f not in SYSTEM_FILES
         ]
         logger.info(
             "=== DEMARRAGE SERVEUR === DATA_DIR='%s' | %d fichier(s) école "
@@ -114,13 +119,8 @@ def _generate_school_code(school_name):
 
 def _get_all_ids_except(school_code):
     all_ids = set()
-    skip = {
-        'keys_store.json', 'ids_store.json',
-        'pending_payments.json', 'mobile_payments.json',
-        'schools_registry.json',
-    }
     for fname in os.listdir(DATA_DIR):
-        if not fname.endswith('.json') or fname in skip:
+        if not fname.endswith('.json') or fname in SYSTEM_FILES:
             continue
         if fname == f"{school_code.lower()}.json":
             continue
@@ -187,10 +187,6 @@ def mobile_money_available():
 # DISTRIBUTION MULTI-MOIS (logique identique à handlePayment Flutter)
 # ====================================================================
 def _get_required_for_month(config, section, mois):
-    """
-    Résolution du montant requis pour un mois donné.
-    Priorité : exception par section > frais par section > défaut 35000.
-    """
     exceptions = config.get('monthlyExceptionsBySection', {}).get(section, {})
     if mois in exceptions:
         return float(exceptions[mois])
@@ -201,11 +197,6 @@ def _get_required_for_month(config, section, mois):
 
 
 def _distribute_payment(config, eleve, start_mois, total_amount):
-    """
-    Distribue un montant à travers les mois à partir de start_mois,
-    exactement comme handlePayment() dans frais_scolaires.dart.
-    Retourne une liste de {'mois': str, 'amount': float}.
-    """
     index = MONTHS.index(start_mois) if start_mois in MONTHS else -1
     if index == -1:
         return []
@@ -232,12 +223,8 @@ def _distribute_payment(config, eleve, start_mois, total_amount):
 
 
 # ====================================================================
-# ⚡ NOUVEAU — LOG DE CHAQUE REQUÊTE ENTRANTE
+# ⚡ LOG DE CHAQUE REQUÊTE ENTRANTE
 # ====================================================================
-# Log générique avant chaque requête : méthode, chemin, IP d'origine.
-# Permet de voir dans la console Render CHAQUE appel reçu, même ceux
-# qui échouent avant d'atteindre la logique métier (utile pour
-# vérifier si le PC arrive même à contacter le serveur).
 @app.before_request
 def _log_incoming_request():
     logger.info(
@@ -365,12 +352,6 @@ def verify_registration_id():
 
 @app.route('/school/get_info_by_reg_id', methods=['POST'])
 def get_info_by_reg_id():
-    """
-    ⚡ NOUVEAU — Retourne le vrai school_code d'une école à partir
-    de son registration_id, même si elle est déjà activée.
-    Utilisé par recovery_screen.dart pour corriger le bug du login
-    sur Windows (l'ID de registration était utilisé comme school_code).
-    """
     try:
         data   = request.get_json()
         reg_id = data.get('registration_id', '').strip().upper()
@@ -517,7 +498,6 @@ def backup():
             logger.warning("backup : données invalides reçues (school_code ou data manquant)")
             return jsonify({"error": "Données invalides"}), 400
 
-        # ⚡ Compte le nombre total d'élèves envoyés, toutes années confondues
         nb_eleves = sum(
             len(yd.get('eleves', []))
             for yd in backup_data.get('history', {}).values()
@@ -534,7 +514,6 @@ def backup():
         with open(filepath, 'w', encoding='utf-8') as f:
             json.dump(corrected_data, f, ensure_ascii=False, indent=2)
 
-        # ⚡ Vérification immédiate que le fichier a bien été écrit sur disque
         file_size = os.path.getsize(filepath) if os.path.exists(filepath) else 0
         logger.info(
             "✅ BACKUP écrit avec succès : école='%s' path='%s' taille=%d octets "
@@ -792,14 +771,9 @@ def parent_find_student():
 
         logger.info("👨‍👩‍👧 parent_find_student : recherche de l'ID '%s'", student_id)
 
-        skip = {
-            'keys_store.json', 'ids_store.json',
-            'pending_payments.json', 'mobile_payments.json',
-            'schools_registry.json',
-        }
         fichiers_ecoles = [
             f for f in os.listdir(DATA_DIR)
-            if f.endswith('.json') and f not in skip
+            if f.endswith('.json') and f not in SYSTEM_FILES
         ]
         logger.info(
             "parent_find_student : %d fichier(s) école à scanner : %s",
@@ -916,11 +890,6 @@ def parent_get_payment_history():
 
 @app.route('/parent/preview_payment', methods=['POST'])
 def parent_preview_payment():
-    """
-    ⚡ NOUVEAU — Calcule et retourne la distribution multi-mois
-    avant que le parent confirme son paiement.
-    Le parent voit exactement quels mois seront couverts.
-    """
     try:
         data        = request.get_json()
         student_id  = data.get('student_id', '').strip().upper()
@@ -950,7 +919,7 @@ def parent_preview_payment():
 
         distribution = _distribute_payment(config, eleve, start_mois, amount)
         total_covered = sum(d['amount'] for d in distribution)
-        remainder     = amount - total_covered  # montant non utilisé (excédent)
+        remainder     = amount - total_covered
 
         logger.info(
             "parent_preview_payment : élève='%s' montant=%s → %d mois couverts",
@@ -969,11 +938,6 @@ def parent_preview_payment():
 
 @app.route('/parent/submit_mobile_payment', methods=['POST'])
 def parent_submit_mobile_payment():
-    """
-    ⚡ CORRIGÉ — Accepte maintenant soit un seul mois, soit une liste
-    de month_entries (distribution multi-mois calculée côté client).
-    Crée une entrée en attente par mois couvert.
-    """
     try:
         data = request.get_json()
         return _store_pending_mobile_payment(data)
@@ -983,20 +947,13 @@ def parent_submit_mobile_payment():
 
 
 def _store_pending_mobile_payment(data):
-    """
-    ⚡ CORRIGÉ — Gère la distribution multi-mois.
-
-    Le client peut envoyer :
-    - Cas A (ancien) : mois + amount → on distribue automatiquement
-    - Cas B (nouveau) : month_entries = [{'mois': ..., 'amount': ...}, ...]
-    """
     try:
         student_id    = data.get('student_id', '').strip().upper()
         school_code   = data.get('school_code', '').strip()
         network       = data.get('network', '')
         parent_name   = data.get('parent_name', 'Parent')
-        month_entries = data.get('month_entries')  # Cas B : liste pré-calculée
-        start_mois    = data.get('mois')           # Cas A : mois de départ
+        month_entries = data.get('month_entries')
+        start_mois    = data.get('mois')
         total_amount  = data.get('amount', 0)
 
         logger.info(
@@ -1031,7 +988,6 @@ def _store_pending_mobile_payment(data):
             )
             return jsonify({"error": "Élève introuvable"}), 404
 
-        # Cas A : calculer la distribution si pas déjà fournie
         if not month_entries:
             if not start_mois or not total_amount:
                 return jsonify({"error": "Mois et montant requis"}), 400
@@ -1050,7 +1006,6 @@ def _store_pending_mobile_payment(data):
         today         = datetime.date.today().isoformat()
         created_ids   = []
 
-        # Créer UNE entrée par mois couvert
         for entry in month_entries:
             payment_id = (
                 f"mob_{datetime.datetime.now().strftime('%Y%m%d%H%M%S%f')}"
@@ -1227,13 +1182,8 @@ def webhook_vodacom():
 
 
 def _auto_confirm_payment(eleve_id, mois, amount, network):
-    skip = {
-        'keys_store.json', 'ids_store.json',
-        'pending_payments.json', 'mobile_payments.json',
-        'schools_registry.json',
-    }
     for fname in os.listdir(DATA_DIR):
-        if not fname.endswith('.json') or fname in skip:
+        if not fname.endswith('.json') or fname in SYSTEM_FILES:
             continue
         fpath = os.path.join(DATA_DIR, fname)
         try:
@@ -1393,9 +1343,10 @@ def generate_student_id():
         if proposed_id and proposed_id not in used_ids:
             candidate = proposed_id
         else:
-            school_name   = data.get('school_name', '')
-            year_short    = year[-2:] if len(year) >= 2 else "26"
-            school_letter = school_name[0].upper() if school_name else "B"
+            school_name = data.get('school_name', '')
+            year_short  = year[-2:] if len(year) >= 2 else "26"
+            alnum_school  = re.sub(r'[^A-Za-z0-9]', '', school_name)
+            school_letter = alnum_school[0].upper() if alnum_school else "B"
             name_prefix   = nom.strip()[:2].upper() if nom.strip() else "XX"
             base_id       = f"{name_prefix}{year_short}{school_letter}"
             counter       = 1
@@ -1415,25 +1366,311 @@ def generate_student_id():
 
 
 # ====================================================================
-# ⚡ NOUVEAU — ROUTE DE DIAGNOSTIC
+# ⚡ NOUVEAU — MODULE DISCIPLINE
+# Trois briques :
+#   1) Absences : le directeur de discipline coche les élèves absents
+#      pour une classe/date, on enregistre le registre ET on notifie
+#      automatiquement chaque parent concerné.
+#   2) Convocations : message individuel envoyé à un parent (mauvais
+#      comportement, etc.), rédigé librement par l'école.
+#   3) Communiqués : message envoyé à un groupe de parents (élèves
+#      sélectionnés, une classe, une section, ou toute l'école).
+# Tous ces messages sont stockés dans MESSAGES_FILE, une entrée par
+# élève ciblé, ce qui permet à l'appli parent de tout récupérer via
+# une seule route (/parent/get_messages) filtrée par élève.
+# La synchronisation côté parent se fait par sondage périodique
+# (polling) — pas de websocket sur cet hébergement — ce qui donne un
+# effet quasi temps-réel amplement suffisant pour ce cas d'usage.
 # ====================================================================
-# Permet de vérifier en un coup d'œil (navigateur ou Postman) l'état
-# actuel du stockage : combien d'écoles sont présentes MAINTENANT sur
-# le disque du serveur, sans exposer les données sensibles.
-# Utile pour confirmer si les données survivent à un redémarrage :
-# notez le résultat, attendez 20-30 min sans requête, puis rappelez
-# cette route et comparez.
+
+def _new_message_id():
+    return f"msg_{datetime.datetime.now().strftime('%Y%m%d%H%M%S%f')}_{os.urandom(3).hex()}"
+
+
+def _add_message_for_student(school_code, student_id, msg_type, title, message, extra=None):
+    messages_store = _load_json(MESSAGES_FILE, {})
+    school_key     = school_code.lower()
+    msg_list       = messages_store.get(school_key, [])
+    entry = {
+        "id":         _new_message_id(),
+        "type":       msg_type,   # 'absence' | 'convocation' | 'announcement'
+        "student_id": student_id,
+        "title":      title,
+        "message":    message,
+        "date":       datetime.date.today().isoformat(),
+        "created_at": datetime.datetime.now().isoformat(),
+        "read":       False,
+    }
+    if extra:
+        entry.update(extra)
+    msg_list.append(entry)
+    messages_store[school_key] = msg_list
+    _save_json(MESSAGES_FILE, messages_store)
+    return entry
+
+
+@app.route('/school/record_absences', methods=['POST'])
+def record_absences():
+    """
+    Enregistre les absences d'une classe pour une date donnée (registre
+    de discipline) et notifie automatiquement le parent de chaque élève
+    coché comme absent.
+    """
+    try:
+        data           = request.get_json()
+        school_code    = data.get('school_code')
+        annee          = data.get('annee')
+        classe         = data.get('classe', '')
+        section        = data.get('section', '')
+        date_str       = data.get('date') or datetime.date.today().isoformat()
+        absent_ids     = data.get('absent_ids', [])
+        recorded_by    = data.get('recorded_by', 'Direction')
+        custom_message = (data.get('message') or '').strip()
+
+        if not school_code or not annee:
+            return jsonify({"error": "Données manquantes"}), 400
+
+        filepath = os.path.join(DATA_DIR, f"{school_code.lower()}.json")
+        if not os.path.exists(filepath):
+            return jsonify({"error": "École introuvable"}), 404
+        with open(filepath, 'r', encoding='utf-8') as f:
+            saved = json.load(f)
+        year_data     = saved.get('history', {}).get(annee, {})
+        eleves_by_id  = {e.get('id'): e for e in year_data.get('eleves', [])}
+
+        attendance_store  = _load_json(ATTENDANCE_FILE, {})
+        school_key        = school_code.lower()
+        school_attendance = attendance_store.get(school_key, {})
+        date_attendance    = school_attendance.get(date_str, {})
+        class_key          = classe or "toutes"
+        date_attendance[class_key] = {
+            "absents":     absent_ids,
+            "section":     section,
+            "recorded_at": datetime.datetime.now().isoformat(),
+            "recorded_by": recorded_by,
+        }
+        school_attendance[date_str] = date_attendance
+        attendance_store[school_key] = school_attendance
+        _save_json(ATTENDANCE_FILE, attendance_store)
+
+        default_text = (custom_message or
+            "Votre enfant était absent(e) à l'école aujourd'hui "
+            "sans justification. Merci de contacter l'administration "
+            "pour toute clarification.")
+
+        sent = []
+        for sid in absent_ids:
+            eleve       = eleves_by_id.get(sid)
+            nom_complet = (f"{eleve.get('nom','')} {eleve.get('postNom','')}".strip()
+                           if eleve else sid)
+            _add_message_for_student(
+                school_code, sid, "absence",
+                "Absence non justifiée",
+                default_text,
+                extra={"nom_eleve": nom_complet, "classe": classe},
+            )
+            sent.append(sid)
+
+        logger.info(
+            "📋 record_absences : école='%s' classe='%s' date='%s' | %d absent(s) notifié(s)",
+            school_code, classe, date_str, len(sent),
+        )
+
+        return jsonify({
+            "message":        "Absences enregistrées et parents notifiés",
+            "notified_count": len(sent),
+        }), 200
+    except Exception as e:
+        logger.exception("Erreur record_absences")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/school/get_attendance', methods=['GET'])
+def get_attendance():
+    """
+    Renvoie le registre déjà enregistré pour une classe/date donnée
+    (utile pour rouvrir le registre du jour sans perdre les cases déjà
+    cochées).
+    """
+    try:
+        school_code = request.args.get('school_code')
+        date_str    = request.args.get('date') or datetime.date.today().isoformat()
+        classe      = request.args.get('classe', 'toutes')
+        if not school_code:
+            return jsonify({"error": "Code manquant"}), 400
+        attendance_store  = _load_json(ATTENDANCE_FILE, {})
+        school_attendance = attendance_store.get(school_code.lower(), {})
+        date_attendance   = school_attendance.get(date_str, {})
+        record = date_attendance.get(classe, {"absents": []})
+        return jsonify(record), 200
+    except Exception as e:
+        logger.exception("Erreur get_attendance")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/school/send_convocation', methods=['POST'])
+def send_convocation():
+    """
+    Envoie un message de convocation à un parent (comportement,
+    discipline...). Le texte est rédigé librement par l'école.
+    """
+    try:
+        data        = request.get_json()
+        school_code = data.get('school_code')
+        student_id  = data.get('student_id')
+        title       = (data.get('title') or 'Convocation des parents').strip()
+        message     = (data.get('message') or '').strip()
+
+        if not school_code or not student_id or not message:
+            return jsonify({"error": "Données manquantes"}), 400
+
+        entry = _add_message_for_student(
+            school_code, student_id, "convocation", title, message)
+
+        logger.info(
+            "📨 send_convocation : école='%s' élève='%s'",
+            school_code, student_id,
+        )
+        return jsonify({"message": "Convocation envoyée", "id": entry["id"]}), 200
+    except Exception as e:
+        logger.exception("Erreur send_convocation")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/school/send_announcement', methods=['POST'])
+def send_announcement():
+    """
+    Envoie un communiqué aux parents. Ciblage :
+      - target = "students" + student_ids = [...]
+      - target = "classe"   + classe = "..."
+      - target = "section"  + section = "..."
+      - target = "all"      (toute l'école)
+    """
+    try:
+        data        = request.get_json()
+        school_code = data.get('school_code')
+        annee       = data.get('annee')
+        title       = (data.get('title') or "Communiqué de l'école").strip()
+        message     = (data.get('message') or '').strip()
+        target      = data.get('target', 'all')
+        student_ids = data.get('student_ids', [])
+        classe      = data.get('classe', '')
+        section     = data.get('section', '')
+
+        if not school_code or not annee or not message:
+            return jsonify({"error": "Données manquantes"}), 400
+
+        filepath = os.path.join(DATA_DIR, f"{school_code.lower()}.json")
+        if not os.path.exists(filepath):
+            return jsonify({"error": "École introuvable"}), 404
+        with open(filepath, 'r', encoding='utf-8') as f:
+            saved = json.load(f)
+        year_data = saved.get('history', {}).get(annee, {})
+        eleves    = year_data.get('eleves', [])
+
+        if target == 'students':
+            targeted = [e for e in eleves if e.get('id') in student_ids]
+        elif target == 'classe':
+            targeted = [e for e in eleves if e.get('classe') == classe]
+        elif target == 'section':
+            targeted = [e for e in eleves if e.get('section') == section]
+        else:
+            targeted = eleves
+
+        sent = []
+        for e in targeted:
+            sid = e.get('id')
+            if not sid:
+                continue
+            _add_message_for_student(
+                school_code, sid, "announcement", title, message,
+                extra={"nom_eleve": f"{e.get('nom','')} {e.get('postNom','')}".strip()},
+            )
+            sent.append(sid)
+
+        logger.info(
+            "📢 send_announcement : école='%s' cible='%s' | %d parent(s) notifié(s)",
+            school_code, target, len(sent),
+        )
+        return jsonify({
+            "message":        "Communiqué envoyé",
+            "notified_count": len(sent),
+        }), 200
+    except Exception as e:
+        logger.exception("Erreur send_announcement")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/parent/get_messages', methods=['GET'])
+def parent_get_messages():
+    """
+    Récupère tous les messages (absences, convocations, communiqués)
+    liés à un élève donné, du plus récent au plus ancien, avec le
+    nombre de messages non lus. Appelée par l'appli parent en boucle
+    (sondage périodique) pour simuler le temps réel.
+    """
+    try:
+        student_id  = request.args.get('student_id', '').strip().upper()
+        school_code = request.args.get('school_code', '').strip()
+        if not student_id or not school_code:
+            return jsonify({"error": "Paramètres manquants"}), 400
+
+        messages_store   = _load_json(MESSAGES_FILE, {})
+        msg_list         = messages_store.get(school_code.lower(), [])
+        student_messages = [
+            m for m in msg_list
+            if m.get('student_id', '').upper() == student_id
+        ]
+        student_messages.sort(key=lambda m: m.get('created_at', ''), reverse=True)
+        unread_count = sum(1 for m in student_messages if not m.get('read'))
+
+        return jsonify({
+            "messages":     student_messages,
+            "unread_count": unread_count,
+        }), 200
+    except Exception as e:
+        logger.exception("Erreur parent_get_messages")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/parent/mark_message_read', methods=['POST'])
+def parent_mark_message_read():
+    try:
+        data        = request.get_json()
+        school_code = (data.get('school_code') or '').strip()
+        message_id  = (data.get('message_id') or '').strip()
+        if not school_code or not message_id:
+            return jsonify({"error": "Données manquantes"}), 400
+
+        messages_store = _load_json(MESSAGES_FILE, {})
+        school_key     = school_code.lower()
+        msg_list       = messages_store.get(school_key, [])
+        found = False
+        for m in msg_list:
+            if m.get('id') == message_id:
+                m['read'] = True
+                found = True
+                break
+        messages_store[school_key] = msg_list
+        _save_json(MESSAGES_FILE, messages_store)
+
+        if not found:
+            return jsonify({"error": "Message introuvable"}), 404
+        return jsonify({"message": "Marqué comme lu"}), 200
+    except Exception as e:
+        logger.exception("Erreur parent_mark_message_read")
+        return jsonify({"error": str(e)}), 500
+
+
+# ====================================================================
+# ⚡ ROUTE DE DIAGNOSTIC
+# ====================================================================
 @app.route('/admin/health', methods=['GET'])
 def admin_health():
     try:
-        skip = {
-            'keys_store.json', 'ids_store.json',
-            'pending_payments.json', 'mobile_payments.json',
-            'schools_registry.json',
-        }
         fichiers_ecoles = [
             f for f in os.listdir(DATA_DIR)
-            if f.endswith('.json') and f not in skip
+            if f.endswith('.json') and f not in SYSTEM_FILES
         ]
         details = []
         for fname in fichiers_ecoles:
