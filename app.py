@@ -12,14 +12,17 @@ app = Flask(__name__)
 DATA_DIR = "school_data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
-KEYS_FILE             = os.path.join(DATA_DIR, "keys_store.json")
-IDS_FILE              = os.path.join(DATA_DIR, "ids_store.json")
-PENDING_FILE          = os.path.join(DATA_DIR, "pending_payments.json")
-MOBILE_PAYMENTS_FILE  = os.path.join(DATA_DIR, "mobile_payments.json")
-SCHOOLS_FILE          = os.path.join(DATA_DIR, "schools_registry.json")
+KEYS_FILE                  = os.path.join(DATA_DIR, "keys_store.json")
+IDS_FILE                   = os.path.join(DATA_DIR, "ids_store.json")
+PENDING_FILE                = os.path.join(DATA_DIR, "pending_payments.json")
+MOBILE_PAYMENTS_FILE        = os.path.join(DATA_DIR, "mobile_payments.json")
+SCHOOLS_FILE                = os.path.join(DATA_DIR, "schools_registry.json")
 # ⚡ NOUVEAU — Module Discipline
-ATTENDANCE_FILE       = os.path.join(DATA_DIR, "attendance_records.json")
-MESSAGES_FILE         = os.path.join(DATA_DIR, "parent_messages.json")
+ATTENDANCE_FILE             = os.path.join(DATA_DIR, "attendance_records.json")
+MESSAGES_FILE                = os.path.join(DATA_DIR, "parent_messages.json")
+# ⚡⚡ NOUVEAU — Clés multi-usages : inscriptions et autres frais en attente
+PENDING_REGISTRATIONS_FILE  = os.path.join(DATA_DIR, "pending_registrations.json")
+PENDING_AUTRES_FRAIS_FILE   = os.path.join(DATA_DIR, "pending_autres_frais.json")
 
 ADMIN_PASSWORD = "edupay_admin_2026"
 
@@ -35,6 +38,13 @@ MONTHS = [
     'Janvier', 'Fevrier', 'Mars', 'Avril', 'Mai', 'Juin'
 ]
 
+# ⚡⚡ NOUVEAU — Types d'accès possibles pour une clé générée par l'admin.
+# PAY  = paiement des frais scolaires mensuels (comportement historique)
+# DISC = discipline (absences, convocations, communiqués)
+# INSC = inscription de nouveaux élèves
+# AFR  = paiement des "autres frais" (frais ponctuels/annexes)
+KEY_TYPES = {'PAY', 'DISC', 'INSC', 'AFR'}
+
 # ⚡ Liste centrale des fichiers "système" (non-écoles) à exclure de tout
 # scan de dossier qui s'attend à ne trouver que des fichiers école.
 # IMPORTANT : chaque nouveau fichier de stockage global (comme
@@ -46,6 +56,7 @@ SYSTEM_FILES = {
     'pending_payments.json', 'mobile_payments.json',
     'schools_registry.json',
     'attendance_records.json', 'parent_messages.json',
+    'pending_registrations.json', 'pending_autres_frais.json',
 }
 
 # ====================================================================
@@ -438,6 +449,8 @@ def activate_school():
                 "localIdCounter": 0,
                 "history": {"2025-2026": {"eleves": []}},
                 "backup_password": password,
+                "autresFrais": [],
+                "autresFraisPaiementsByYear": {},
             }
             with open(filepath, 'w', encoding='utf-8') as f:
                 json.dump(initial_data, f, ensure_ascii=False, indent=2)
@@ -559,7 +572,7 @@ def restore():
 
 
 # ====================================================================
-# PAIEMENTS EN ATTENTE (sous-utilisateur)
+# PAIEMENTS EN ATTENTE (sous-utilisateur — clé de type PAY)
 # ====================================================================
 
 @app.route('/record_payment', methods=['POST'])
@@ -1248,26 +1261,74 @@ def verify_password():
         return jsonify({"error": str(e)}), 500
 
 
+# ====================================================================
+# ⚡⚡ NOUVEAU — CLÉS D'ACCÈS MULTI-USAGES
+# ====================================================================
+# Une clé encode désormais 4 informations :
+#   - school_code : l'école concernée
+#   - type        : PAY | DISC | INSC | AFR (ce que le sous-utilisateur
+#                   peut faire une fois connecté avec cette clé)
+#   - section     : la section sur laquelle il travaille
+#   - classe      : soit une classe précise, soit None/"" pour signifier
+#                   "toutes les classes de la section"
+# Le format texte de la clé reste lisible par un humain, à des fins de
+# debug/support : SCHOOLCODE*TYPE*SEC*CLASSE*alea
+# (CLASSE vaut littéralement "ALL" quand aucune classe n'est précisée)
+# ====================================================================
+
+def _slug(value, max_len=12):
+    """Réduit une chaîne à des caractères alphanumériques, en majuscules,
+    pour l'insérer proprement dans la clé texte (la classe peut contenir
+    des espaces, accents, etc. ex: '6ème A')."""
+    cleaned = re.sub(r'[^A-Za-z0-9]', '', value or '')
+    return cleaned.upper()[:max_len] if cleaned else "ALL"
+
+
 @app.route('/generate_key', methods=['POST'])
 def generate_key():
     try:
         data        = request.get_json()
         school_code = data.get('school_code')
         section     = data.get('section')
+        # ⚡⚡ NOUVEAU — type d'accès. 'PAY' par défaut pour rester
+        # compatible avec d'anciens clients qui n'enverraient pas ce champ.
+        key_type    = (data.get('type') or 'PAY').strip().upper()
+        # ⚡⚡ NOUVEAU — classe ciblée, ou vide/None = toutes les classes
+        # de la section.
+        classe      = (data.get('classe') or '').strip()
+
         if not school_code or not section:
             return jsonify({"error": "Données manquantes"}), 400
-        key  = (
-            f"{school_code.upper()}*{section.upper()[:3]}"
-            f"*{os.urandom(4).hex()}"
+
+        if key_type not in KEY_TYPES:
+            return jsonify({
+                "error": f"Type de clé invalide. Valeurs possibles : "
+                         f"{', '.join(sorted(KEY_TYPES))}"
+            }), 400
+
+        key = (
+            f"{school_code.upper()}*{key_type}*{section.upper()[:3]}"
+            f"*{_slug(classe)}*{os.urandom(4).hex()}"
         )
         keys      = _load_json(KEYS_FILE, {})
-        keys[key] = {"school_code": school_code, "section": section}
+        keys[key] = {
+            "school_code": school_code,
+            "section":     section,
+            "type":        key_type,
+            # None = toutes les classes de la section
+            "classe":      classe if classe else None,
+        }
         _save_json(KEYS_FILE, keys)
         logger.info(
-            "🔑 generate_key : école='%s' section='%s' → clé générée",
-            school_code, section,
+            "🔑 generate_key : école='%s' type='%s' section='%s' classe='%s' → clé générée",
+            school_code, key_type, section, classe or "TOUTES",
         )
-        return jsonify({"key": key, "section": section}), 200
+        return jsonify({
+            "key":     key,
+            "section": section,
+            "type":    key_type,
+            "classe":  classe or None,
+        }), 200
     except Exception as e:
         logger.exception("Erreur generate_key")
         return jsonify({"error": str(e)}), 500
@@ -1294,11 +1355,18 @@ def verify_key():
                 saved = json.load(f)
             school_name  = saved.get('config', {}).get('schoolName', school_code)
             current_year = saved.get('currentYear')
-        logger.info("verify_key : clé valide pour école='%s' section='%s'", school_code, info["section"])
+        logger.info(
+            "verify_key : clé valide pour école='%s' type='%s' section='%s' classe='%s'",
+            school_code, info.get('type', 'PAY'), info["section"], info.get('classe'),
+        )
         return jsonify({
             "valid":        True,
             "school_code":  school_code,
             "section":      info["section"],
+            # ⚡⚡ NOUVEAU — anciennes clés déjà en circulation sans 'type' :
+            # on retombe sur 'PAY' pour ne rien casser.
+            "type":         info.get("type", "PAY"),
+            "classe":       info.get("classe"),  # None = toutes les classes
             "school_name":  school_name,
             "current_year": current_year,
         }), 200
@@ -1325,6 +1393,58 @@ def revoke_key():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route('/list_keys', methods=['GET'])
+def list_keys():
+    """⚡⚡ NOUVEAU — Liste toutes les clés actives d'une école, pour que
+    l'admin puisse voir/gérer (et révoquer) les clés déjà distribuées,
+    avec leur type, section et classe."""
+    try:
+        school_code = request.args.get('school_code')
+        if not school_code:
+            return jsonify({"error": "Code manquant"}), 400
+        keys   = _load_json(KEYS_FILE, {})
+        result = [
+            {
+                "key":     k,
+                "type":    v.get("type", "PAY"),
+                "section": v.get("section"),
+                "classe":  v.get("classe"),
+            }
+            for k, v in keys.items()
+            if v.get("school_code") == school_code
+        ]
+        return jsonify({"keys": result, "total": len(result)}), 200
+    except Exception as e:
+        logger.exception("Erreur list_keys")
+        return jsonify({"error": str(e)}), 500
+
+
+def _generate_student_id_for_school(school_code, nom, year, school_name, proposed_id=None):
+    """Factorisation de la logique déjà utilisée par /generate_student_id,
+    réutilisée aussi par la validation des inscriptions en attente."""
+    ids_store = _load_json(IDS_FILE, {})
+    used_ids  = set(ids_store.get(school_code.lower(), []))
+
+    if proposed_id and proposed_id not in used_ids:
+        candidate = proposed_id
+    else:
+        year_short    = year[-2:] if year and len(year) >= 2 else "26"
+        alnum_school  = re.sub(r'[^A-Za-z0-9]', '', school_name or '')
+        school_letter = alnum_school[0].upper() if alnum_school else "B"
+        name_prefix   = nom.strip()[:2].upper() if nom.strip() else "XX"
+        base_id       = f"{name_prefix}{year_short}{school_letter}"
+        counter       = 1
+        candidate     = f"{base_id}{counter}"
+        while candidate in used_ids:
+            counter  += 1
+            candidate = f"{base_id}{counter}"
+
+    used_ids.add(candidate)
+    ids_store[school_code.lower()] = list(used_ids)
+    _save_json(IDS_FILE, ids_store)
+    return candidate
+
+
 @app.route('/generate_student_id', methods=['POST'])
 def generate_student_id():
     try:
@@ -1333,31 +1453,13 @@ def generate_student_id():
         nom         = data.get('nom', '')
         year        = data.get('year', '2025-2026')
         proposed_id = data.get('proposed_id')
+        school_name = data.get('school_name', '')
 
         if not school_code or not nom:
             return jsonify({"error": "Données manquantes"}), 400
 
-        ids_store = _load_json(IDS_FILE, {})
-        used_ids  = set(ids_store.get(school_code.lower(), []))
-
-        if proposed_id and proposed_id not in used_ids:
-            candidate = proposed_id
-        else:
-            school_name = data.get('school_name', '')
-            year_short  = year[-2:] if len(year) >= 2 else "26"
-            alnum_school  = re.sub(r'[^A-Za-z0-9]', '', school_name)
-            school_letter = alnum_school[0].upper() if alnum_school else "B"
-            name_prefix   = nom.strip()[:2].upper() if nom.strip() else "XX"
-            base_id       = f"{name_prefix}{year_short}{school_letter}"
-            counter       = 1
-            candidate     = f"{base_id}{counter}"
-            while candidate in used_ids:
-                counter  += 1
-                candidate = f"{base_id}{counter}"
-
-        used_ids.add(candidate)
-        ids_store[school_code.lower()] = list(used_ids)
-        _save_json(IDS_FILE, ids_store)
+        candidate = _generate_student_id_for_school(
+            school_code, nom, year, school_name, proposed_id)
         logger.info("generate_student_id : école='%s' → id='%s'", school_code, candidate)
         return jsonify({"id": candidate}), 200
     except Exception as e:
@@ -1366,7 +1468,397 @@ def generate_student_id():
 
 
 # ====================================================================
-# ⚡ NOUVEAU — MODULE DISCIPLINE
+# ⚡⚡ NOUVEAU — INSCRIPTIONS EN ATTENTE (clé de type INSC)
+# Même philosophie que les paiements : le sous-utilisateur (agent chargé
+# des inscriptions) soumet une fiche élève, qui reste "en attente" tant
+# que l'admin ne l'a pas validée depuis admin_dashboard_screen.dart. Cela
+# évite les doublons/erreurs de saisie directement dans les données
+# officielles de l'école.
+# ====================================================================
+
+@app.route('/school/submit_registration', methods=['POST'])
+def submit_registration():
+    try:
+        data        = request.get_json()
+        school_code = data.get('school_code')
+        annee       = data.get('annee')
+        section     = (data.get('section') or '').strip()
+        classe      = (data.get('classe') or '').strip()
+        nom         = (data.get('nom') or '').strip()
+        post_nom    = (data.get('postNom') or '').strip()
+        prenom      = (data.get('prenom') or '').strip()
+        pere_nom    = (data.get('pereNom') or '').strip()
+        mere_nom    = (data.get('mereNom') or '').strip()
+        adresse     = (data.get('adresse') or '').strip()
+        naissance   = (data.get('dateNaissance') or '').strip()
+        submitted_by = (data.get('submitted_by') or 'Agent inscriptions').strip()
+
+        if not all([school_code, annee, section, classe, nom]):
+            return jsonify({
+                "error": "École, année, section, classe et nom sont obligatoires"
+            }), 400
+
+        filepath = os.path.join(DATA_DIR, f"{school_code.lower()}.json")
+        if not os.path.exists(filepath):
+            return jsonify({"error": "École introuvable"}), 404
+
+        registration_id = (
+            f"reg_{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}"
+            f"_{os.urandom(3).hex()}"
+        )
+
+        pending_store = _load_json(PENDING_REGISTRATIONS_FILE, {})
+        school_key    = school_code.lower()
+        pending_list  = pending_store.get(school_key, [])
+        pending_list.append({
+            "id":            registration_id,
+            "annee":         annee,
+            "section":       section,
+            "classe":        classe,
+            "nom":           nom,
+            "postNom":       post_nom,
+            "prenom":        prenom,
+            "pereNom":       pere_nom,
+            "mereNom":       mere_nom,
+            "adresse":       adresse,
+            "dateNaissance": naissance,
+            "submitted_by":  submitted_by,
+            "date":          datetime.date.today().isoformat(),
+        })
+        pending_store[school_key] = pending_list
+        _save_json(PENDING_REGISTRATIONS_FILE, pending_store)
+
+        logger.info(
+            "🧑‍🎓 submit_registration : école='%s' élève='%s %s' classe='%s' → id_attente='%s'",
+            school_code, nom, prenom, classe, registration_id,
+        )
+
+        return jsonify({
+            "message":         "Inscription reçue, en attente de validation",
+            "registration_id": registration_id,
+        }), 200
+    except Exception as e:
+        logger.exception("Erreur submit_registration")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/school/get_pending_registrations', methods=['GET'])
+def get_pending_registrations():
+    try:
+        school_code = request.args.get('school_code')
+        if not school_code:
+            return jsonify({"error": "Code manquant"}), 400
+        pending_store = _load_json(PENDING_REGISTRATIONS_FILE, {})
+        pending_list  = pending_store.get(school_code.lower(), [])
+        logger.info(
+            "get_pending_registrations : école='%s' → %d en attente",
+            school_code, len(pending_list),
+        )
+        return jsonify({"pending_registrations": pending_list}), 200
+    except Exception as e:
+        logger.exception("Erreur get_pending_registrations")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/school/validate_registrations', methods=['POST'])
+def validate_registrations():
+    try:
+        data            = request.get_json()
+        school_code     = data.get('school_code')
+        registration_ids = data.get('registration_ids')
+
+        if not school_code:
+            return jsonify({"error": "Code manquant"}), 400
+
+        school_key = school_code.lower()
+        filepath   = os.path.join(DATA_DIR, f"{school_key}.json")
+        if not os.path.exists(filepath):
+            return jsonify({"error": "École introuvable"}), 404
+
+        with open(filepath, 'r', encoding='utf-8') as f:
+            saved = json.load(f)
+
+        school_name = saved.get('config', {}).get('schoolName', school_code)
+
+        pending_store = _load_json(PENDING_REGISTRATIONS_FILE, {})
+        pending_list  = pending_store.get(school_key, [])
+
+        if registration_ids:
+            to_validate = [p for p in pending_list if p.get('id') in registration_ids]
+            remaining   = [p for p in pending_list if p.get('id') not in registration_ids]
+        else:
+            to_validate = pending_list
+            remaining   = []
+
+        created_students = []
+        for entry in to_validate:
+            annee = entry.get('annee')
+            saved.setdefault('history', {}).setdefault(annee, {}).setdefault('eleves', [])
+            year_data = saved['history'][annee]
+
+            new_id = _generate_student_id_for_school(
+                school_code, entry.get('nom', ''), annee, school_name)
+
+            year_data['eleves'].append({
+                "id":            new_id,
+                "nom":           entry.get('nom', ''),
+                "postNom":       entry.get('postNom', ''),
+                "prenom":        entry.get('prenom', ''),
+                "classe":        entry.get('classe', ''),
+                "section":       entry.get('section', ''),
+                "paid":          {},
+                "transactions":  [],
+                "pereNom":       entry.get('pereNom', ''),
+                "mereNom":       entry.get('mereNom', ''),
+                "adresse":       entry.get('adresse', ''),
+                "dateNaissance": entry.get('dateNaissance', ''),
+                "customFields":  {},
+            })
+            created_students.append({"registration_id": entry.get('id'), "new_id": new_id})
+
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(saved, f, ensure_ascii=False, indent=2)
+
+        pending_store[school_key] = remaining
+        _save_json(PENDING_REGISTRATIONS_FILE, pending_store)
+
+        logger.info(
+            "✅ validate_registrations : école='%s' | %d validée(s) | %d restante(s)",
+            school_code, len(created_students), len(remaining),
+        )
+
+        return jsonify({
+            "message":          "Inscriptions validées",
+            "created_students": created_students,
+            "remaining":        len(remaining),
+        }), 200
+    except Exception as e:
+        logger.exception("Erreur validate_registrations")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/school/reject_registration', methods=['POST'])
+def reject_registration():
+    try:
+        data            = request.get_json()
+        school_code     = data.get('school_code')
+        registration_id = data.get('registration_id')
+        if not school_code or not registration_id:
+            return jsonify({"error": "Données manquantes"}), 400
+
+        school_key    = school_code.lower()
+        pending_store = _load_json(PENDING_REGISTRATIONS_FILE, {})
+        pending_list  = pending_store.get(school_key, [])
+        pending_list  = [p for p in pending_list if p.get('id') != registration_id]
+        pending_store[school_key] = pending_list
+        _save_json(PENDING_REGISTRATIONS_FILE, pending_store)
+        logger.info("reject_registration : école='%s' id='%s' rejetée", school_code, registration_id)
+        return jsonify({"message": "Inscription rejetée"}), 200
+    except Exception as e:
+        logger.exception("Erreur reject_registration")
+        return jsonify({"error": str(e)}), 500
+
+
+# ====================================================================
+# ⚡⚡ NOUVEAU — AUTRES FRAIS (clé de type AFR)
+# Consultation des "autres frais" existants (créés par l'admin depuis
+# Paramètres) et soumission de paiements, également en file d'attente
+# de validation — même logique que /record_payment pour les frais
+# mensuels.
+# ====================================================================
+
+@app.route('/school/get_autres_frais', methods=['GET'])
+def get_autres_frais():
+    try:
+        school_code = request.args.get('school_code')
+        if not school_code:
+            return jsonify({"error": "Code manquant"}), 400
+        filepath = os.path.join(DATA_DIR, f"{school_code.lower()}.json")
+        if not os.path.exists(filepath):
+            return jsonify({"error": "École introuvable"}), 404
+        with open(filepath, 'r', encoding='utf-8') as f:
+            saved = json.load(f)
+        return jsonify({
+            "autres_frais": saved.get('autresFrais', []),
+        }), 200
+    except Exception as e:
+        logger.exception("Erreur get_autres_frais")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/school/submit_autre_frais_payment', methods=['POST'])
+def submit_autre_frais_payment():
+    try:
+        data            = request.get_json()
+        school_code     = data.get('school_code')
+        annee           = data.get('annee')
+        eleve_id        = data.get('eleve_id')
+        autre_frais_id  = data.get('autre_frais_id')
+        montant         = data.get('montant')
+        enregistre_par  = (data.get('enregistre_par') or 'Agent').strip()
+
+        if not all([school_code, annee, eleve_id, autre_frais_id]) or montant is None:
+            return jsonify({"error": "Données manquantes"}), 400
+
+        filepath = os.path.join(DATA_DIR, f"{school_code.lower()}.json")
+        if not os.path.exists(filepath):
+            return jsonify({"error": "École introuvable"}), 404
+        with open(filepath, 'r', encoding='utf-8') as f:
+            saved = json.load(f)
+
+        frais = next(
+            (f for f in saved.get('autresFrais', [])
+             if f.get('id') == autre_frais_id), None)
+        if frais is None:
+            return jsonify({"error": "Frais introuvable"}), 404
+
+        year_data = saved.get('history', {}).get(annee, {})
+        eleve = next(
+            (e for e in year_data.get('eleves', [])
+             if e.get('id') == eleve_id), None)
+        if eleve is None:
+            return jsonify({"error": "Élève introuvable"}), 404
+
+        payment_id = (
+            f"afr_{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}"
+            f"_{os.urandom(3).hex()}"
+        )
+
+        pending_store = _load_json(PENDING_AUTRES_FRAIS_FILE, {})
+        school_key    = school_code.lower()
+        pending_list  = pending_store.get(school_key, [])
+        pending_list.append({
+            "id":             payment_id,
+            "annee":          annee,
+            "eleve_id":       eleve_id,
+            "nom":            eleve.get('nom', ''),
+            "postNom":        eleve.get('postNom', ''),
+            "prenom":         eleve.get('prenom', ''),
+            "autreFraisId":   autre_frais_id,
+            "autreFraisNom":  frais.get('nom', ''),
+            "montant":        montant,
+            "enregistrePar":  enregistre_par,
+            "date":           datetime.datetime.now().isoformat(),
+        })
+        pending_store[school_key] = pending_list
+        _save_json(PENDING_AUTRES_FRAIS_FILE, pending_store)
+
+        logger.info(
+            "💰 submit_autre_frais_payment : école='%s' élève='%s' frais='%s' montant=%s → id_attente='%s'",
+            school_code, eleve_id, frais.get('nom', ''), montant, payment_id,
+        )
+
+        return jsonify({
+            "message":    "Paiement reçu, en attente de validation",
+            "pending_id": payment_id,
+        }), 200
+    except Exception as e:
+        logger.exception("Erreur submit_autre_frais_payment")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/school/get_pending_autres_frais', methods=['GET'])
+def get_pending_autres_frais():
+    try:
+        school_code = request.args.get('school_code')
+        if not school_code:
+            return jsonify({"error": "Code manquant"}), 400
+        pending_store = _load_json(PENDING_AUTRES_FRAIS_FILE, {})
+        pending_list  = pending_store.get(school_code.lower(), [])
+        return jsonify({"pending_autres_frais": pending_list}), 200
+    except Exception as e:
+        logger.exception("Erreur get_pending_autres_frais")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/school/validate_autres_frais_payments', methods=['POST'])
+def validate_autres_frais_payments():
+    try:
+        data        = request.get_json()
+        school_code = data.get('school_code')
+        payment_ids = data.get('payment_ids')
+
+        if not school_code:
+            return jsonify({"error": "Code manquant"}), 400
+
+        school_key = school_code.lower()
+        filepath   = os.path.join(DATA_DIR, f"{school_key}.json")
+        if not os.path.exists(filepath):
+            return jsonify({"error": "École introuvable"}), 404
+
+        with open(filepath, 'r', encoding='utf-8') as f:
+            saved = json.load(f)
+        saved.setdefault('autresFraisPaiementsByYear', {})
+
+        pending_store = _load_json(PENDING_AUTRES_FRAIS_FILE, {})
+        pending_list  = pending_store.get(school_key, [])
+
+        if payment_ids:
+            to_validate = [p for p in pending_list if p.get('id') in payment_ids]
+            remaining   = [p for p in pending_list if p.get('id') not in payment_ids]
+        else:
+            to_validate = pending_list
+            remaining   = []
+
+        validated_count = 0
+        for entry in to_validate:
+            annee = entry.get('annee')
+            saved['autresFraisPaiementsByYear'].setdefault(annee, [])
+            saved['autresFraisPaiementsByYear'][annee].append({
+                "id":            entry.get('id'),
+                "autreFraisId":  entry.get('autreFraisId'),
+                "autreFraisNom": entry.get('autreFraisNom'),
+                "eleveId":       entry.get('eleve_id'),
+                "montant":       entry.get('montant'),
+                "date":          entry.get('date'),
+                "enregistrePar": entry.get('enregistrePar', 'Agent'),
+            })
+            validated_count += 1
+
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(saved, f, ensure_ascii=False, indent=2)
+
+        pending_store[school_key] = remaining
+        _save_json(PENDING_AUTRES_FRAIS_FILE, pending_store)
+
+        logger.info(
+            "✅ validate_autres_frais_payments : école='%s' | %d validé(s) | %d restant(s)",
+            school_code, validated_count, len(remaining),
+        )
+
+        return jsonify({
+            "message":           "Paiements validés",
+            "validated_count":   validated_count,
+            "remaining_pending": len(remaining),
+        }), 200
+    except Exception as e:
+        logger.exception("Erreur validate_autres_frais_payments")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/school/reject_autre_frais_payment', methods=['POST'])
+def reject_autre_frais_payment():
+    try:
+        data        = request.get_json()
+        school_code = data.get('school_code')
+        payment_id  = data.get('payment_id')
+        if not school_code or not payment_id:
+            return jsonify({"error": "Données manquantes"}), 400
+
+        school_key    = school_code.lower()
+        pending_store = _load_json(PENDING_AUTRES_FRAIS_FILE, {})
+        pending_list  = pending_store.get(school_key, [])
+        pending_list  = [p for p in pending_list if p.get('id') != payment_id]
+        pending_store[school_key] = pending_list
+        _save_json(PENDING_AUTRES_FRAIS_FILE, pending_store)
+        return jsonify({"message": "Paiement rejeté"}), 200
+    except Exception as e:
+        logger.exception("Erreur reject_autre_frais_payment")
+        return jsonify({"error": str(e)}), 500
+
+
+# ====================================================================
+# ⚡ NOUVEAU — MODULE DISCIPLINE (clé de type DISC)
 # Trois briques :
 #   1) Absences : le directeur de discipline coche les élèves absents
 #      pour une classe/date, on enregistre le registre ET on notifie
@@ -1378,6 +1870,10 @@ def generate_student_id():
 # Tous ces messages sont stockés dans MESSAGES_FILE, une entrée par
 # élève ciblé, ce qui permet à l'appli parent de tout récupérer via
 # une seule route (/parent/get_messages) filtrée par élève.
+# ⚡⚡ Ces routes sont désormais aussi appelées par le sous-utilisateur
+# détenteur d'une clé de type DISC (verrouillée sur une section/classe),
+# exactement comme l'admin les appelle depuis discipline_registre_screen.dart
+# et communique_screen.dart — aucune modification nécessaire ici.
 # La synchronisation côté parent se fait par sondage périodique
 # (polling) — pas de websocket sur cet hébergement — ce qui donne un
 # effet quasi temps-réel amplement suffisant pour ce cas d'usage.
