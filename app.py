@@ -23,6 +23,8 @@ MESSAGES_FILE                = os.path.join(DATA_DIR, "parent_messages.json")
 # ⚡⚡ NOUVEAU — Clés multi-usages : inscriptions et autres frais en attente
 PENDING_REGISTRATIONS_FILE  = os.path.join(DATA_DIR, "pending_registrations.json")
 PENDING_AUTRES_FRAIS_FILE   = os.path.join(DATA_DIR, "pending_autres_frais.json")
+# ⚡⚡⚡ NOUVEAU — Système d'abonnement / clés de reconnexion
+SUBSCRIPTION_KEYS_FILE      = os.path.join(DATA_DIR, "subscription_keys.json")
 
 ADMIN_PASSWORD = "edupay_admin_2026"
 
@@ -32,6 +34,24 @@ ORANGE_MERCHANT_ID  = os.environ.get('ORANGE_MERCHANT_ID', '')
 ORANGE_API_KEY      = os.environ.get('ORANGE_API_KEY', '')
 VODACOM_MERCHANT_ID = os.environ.get('VODACOM_MERCHANT_ID', '')
 VODACOM_API_KEY     = os.environ.get('VODACOM_API_KEY', '')
+
+# ====================================================================
+# ⚡⚡⚡ NOUVEAU — GESTION DE L'ABONNEMENT (LICENCE)
+# ====================================================================
+# Chaque école dispose d'une période d'abonnement qui démarre au moment
+# de son activation (/school/activate) et qui est redémarrée à chaque
+# fois qu'une CLÉ DE RECONNEXION valide (générée par l'admin depuis
+# admin_panel.py) est consommée via /school/redeem_reconnection_key.
+#
+# ⚡ MODE TEST : la durée est fixée à 60 secondes (1 minute), comme
+# demandé, pour pouvoir tester rapidement tout le scénario complet
+# (activation -> expiration -> clé de reconnexion -> nouvel accès).
+#
+# 🚀 POUR LA PRODUCTION : il suffit de mettre SUBSCRIPTION_TEST_MODE à
+# False ci-dessous. La durée passera automatiquement à 30 jours, sans
+# rien changer d'autre dans le code.
+SUBSCRIPTION_TEST_MODE = True
+SUBSCRIPTION_DURATION_SECONDS = 60 if SUBSCRIPTION_TEST_MODE else 30 * 24 * 60 * 60
 
 MONTHS = [
     'Septembre', 'Octobre', 'Novembre', 'Decembre',
@@ -57,6 +77,7 @@ SYSTEM_FILES = {
     'schools_registry.json',
     'attendance_records.json', 'parent_messages.json',
     'pending_registrations.json', 'pending_autres_frais.json',
+    'subscription_keys.json',
 }
 
 # ====================================================================
@@ -80,8 +101,10 @@ def _log_startup_state():
         ]
         logger.info(
             "=== DEMARRAGE SERVEUR === DATA_DIR='%s' | %d fichier(s) école "
-            "trouvé(s) au démarrage : %s",
+            "trouvé(s) au démarrage : %s | mode_abonnement=%s (%ds)",
             os.path.abspath(DATA_DIR), len(school_files), school_files,
+            "TEST" if SUBSCRIPTION_TEST_MODE else "PRODUCTION",
+            SUBSCRIPTION_DURATION_SECONDS,
         )
         if not school_files:
             logger.warning(
@@ -195,6 +218,95 @@ def mobile_money_available():
 
 
 # ====================================================================
+# ⚡⚡⚡ NOUVEAU — HELPERS ABONNEMENT / CLÉ DE RECONNEXION
+# ====================================================================
+
+def _find_school_entry(school_code):
+    """Recherche insensible à la casse d'une école dans le registre.
+    Renvoie (code_reel, dict_ecole) ou (None, None) si introuvable."""
+    if not school_code:
+        return None, None
+    schools = _load_json(SCHOOLS_FILE, {})
+    target = school_code.strip().upper()
+    for code, school in schools.items():
+        if code.upper() == target:
+            return code, school
+    return None, None
+
+
+def _generate_reconnection_key_str():
+    chars  = string.ascii_uppercase + string.digits
+    groups = [''.join(secrets.choice(chars) for _ in range(4)) for _ in range(3)]
+    return f"RECO-{'-'.join(groups)}"
+
+
+def _start_new_subscription_period(school):
+    """Démarre (ou redémarre) une période d'abonnement complète pour
+    l'école donnée : maintenant -> maintenant + SUBSCRIPTION_DURATION_SECONDS.
+    Modifie le dict `school` EN PLACE (celui-ci doit provenir d'un
+    dictionnaire chargé depuis SCHOOLS_FILE, pour que la modification
+    soit bien sauvegardée par l'appelant via _save_json)."""
+    now     = datetime.datetime.now()
+    expires = now + datetime.timedelta(seconds=SUBSCRIPTION_DURATION_SECONDS)
+    school['subscription_started_at'] = now.isoformat()
+    school['subscription_expires_at'] = expires.isoformat()
+    school['subscription_blocked']    = False
+    return school
+
+
+def _compute_subscription_status(school):
+    """Calcule l'état d'abonnement d'une école à partir de son entrée
+    dans le registre central. Ne renvoie jamais None : une école sans
+    aucune information d'abonnement (compte créé avant l'introduction
+    de cette fonctionnalité) est considérée VALIDE par défaut, pour ne
+    jamais bloquer rétroactivement un compte existant."""
+    if not school:
+        return {
+            "valid":             False,
+            "blocked":           True,
+            "expires_at":        None,
+            "seconds_remaining": 0,
+        }
+
+    if school.get('subscription_blocked'):
+        return {
+            "valid":             False,
+            "blocked":           True,
+            "expires_at":        school.get('subscription_expires_at'),
+            "seconds_remaining": 0,
+        }
+
+    expires_at_str = school.get('subscription_expires_at')
+    if not expires_at_str:
+        return {
+            "valid":             True,
+            "blocked":           False,
+            "expires_at":        None,
+            "seconds_remaining": None,
+        }
+
+    try:
+        expires_at = datetime.datetime.fromisoformat(expires_at_str)
+    except Exception:
+        return {
+            "valid":             True,
+            "blocked":           False,
+            "expires_at":        expires_at_str,
+            "seconds_remaining": None,
+        }
+
+    now       = datetime.datetime.now()
+    remaining = (expires_at - now).total_seconds()
+    is_valid  = remaining > 0
+    return {
+        "valid":             is_valid,
+        "blocked":           False,
+        "expires_at":        expires_at_str,
+        "seconds_remaining": max(0, int(remaining)),
+    }
+
+
+# ====================================================================
 # DISTRIBUTION MULTI-MOIS (logique identique à handlePayment Flutter)
 # ====================================================================
 def _get_required_for_month(config, section, mois):
@@ -294,6 +406,13 @@ def admin_register_school():
             "activated":       False,
             "registered_at":   datetime.datetime.now().isoformat(),
             "activated_at":    None,
+            # ⚡⚡⚡ NOUVEAU — champs d'abonnement, remplis réellement à
+            # l'activation (voir /school/activate). Laissés vides ici
+            # pour qu'une école non encore activée ne soit jamais
+            # comptée comme "expirée".
+            "subscription_started_at": None,
+            "subscription_expires_at": None,
+            "subscription_blocked":    False,
         }
         _save_json(SCHOOLS_FILE, schools)
 
@@ -419,6 +538,10 @@ def activate_school():
 
         schools[target_code]['activated']    = True
         schools[target_code]['activated_at'] = datetime.datetime.now().isoformat()
+        # ⚡⚡⚡ NOUVEAU — démarre la période d'abonnement de l'école dès
+        # son activation (voir SUBSCRIPTION_DURATION_SECONDS en haut du
+        # fichier : 1 minute en mode test, 30 jours en production).
+        _start_new_subscription_period(schools[target_code])
         _save_json(SCHOOLS_FILE, schools)
 
         school_info = schools[target_code]
@@ -468,6 +591,10 @@ def activate_school():
             "message":     "Compte activé avec succès. Bienvenue sur EduPay !",
             "school_code": target_code,
             "school_name": final_name,
+            # ⚡⚡⚡ NOUVEAU — permet au client Flutter d'initialiser tout
+            # de suite son cache local d'abonnement (SubscriptionService).
+            "subscription_expires_at": schools[target_code].get('subscription_expires_at'),
+            "subscription_seconds":    SUBSCRIPTION_DURATION_SECONDS,
         }), 200
     except Exception as e:
         logger.exception("Erreur activate_school")
@@ -489,6 +616,10 @@ def list_schools():
             "activated":     s.get('activated', False),
             "registered_at": s.get('registered_at'),
             "activated_at":  s.get('activated_at'),
+            # ⚡⚡⚡ NOUVEAU — état d'abonnement complet, utilisé par
+            # l'interface admin (admin_panel.py) pour afficher qui est
+            # en règle et qui a besoin d'une clé de reconnexion.
+            "subscription":  _compute_subscription_status(s),
         } for sc, s in schools.items()]
         logger.info("list_schools : %d école(s) enregistrée(s)", len(summary))
         return jsonify({"schools": summary, "total": len(summary)}), 200
@@ -534,10 +665,16 @@ def backup():
             school_code, filepath, file_size, len(corrections),
         )
 
+        # ⚡⚡⚡ NOUVEAU — on joint l'état de l'abonnement à la réponse du
+        # backup : c'est un des moments où l'appli a forcément internet,
+        # donc l'occasion idéale de rafraîchir le cache local côté
+        # client (SubscriptionService.applyServerSubscription).
+        _, school_entry = _find_school_entry(school_code)
         return jsonify({
-            "message":     "Sauvegarde réussie",
-            "school_code": school_code,
-            "corrections": corrections,
+            "message":      "Sauvegarde réussie",
+            "school_code":  school_code,
+            "corrections":  corrections,
+            "subscription": _compute_subscription_status(school_entry),
         }), 200
     except Exception as e:
         logger.exception("❌ Erreur lors du BACKUP pour école='%s'", request.get_json(silent=True) or {})
@@ -563,6 +700,11 @@ def restore():
             school_code, nb_eleves,
         )
         data.pop('backup_password', None)
+        # ⚡⚡⚡ NOUVEAU — état d'abonnement inclus dans la restauration,
+        # pour que le client rafraîchisse son cache local dès qu'il a
+        # internet (utile notamment lors d'une restauration classique).
+        _, school_entry = _find_school_entry(school_code)
+        data['subscription'] = _compute_subscription_status(school_entry)
         return jsonify(data), 200
     logger.warning(
         "❌ RESTORE : aucune sauvegarde trouvée pour école='%s' (fichier attendu : '%s')",
@@ -1249,7 +1391,23 @@ def verify_password():
             with open(filepath, 'r', encoding='utf-8') as f:
                 saved_data = json.load(f)
             if saved_data.get('backup_password') == password:
-                return jsonify({"valid": True}), 200
+                # ⚡⚡⚡ NOUVEAU — on joint l'état de l'abonnement à la
+                # réponse de connexion. C'est LE moment clé : quand un
+                # utilisateur se connecte depuis un NOUVEL ordinateur
+                # avec code école + mot de passe, c'est ici que le
+                # serveur détermine s'il faut le rediriger vers l'écran
+                # "Abonnement expiré" (le client Flutter lit
+                # `subscription.valid`).
+                _, school_entry = _find_school_entry(school_code)
+                subscription = _compute_subscription_status(school_entry)
+                logger.info(
+                    "verify_password : école='%s' mot de passe OK | abonnement_valide=%s",
+                    school_code, subscription['valid'],
+                )
+                return jsonify({
+                    "valid":        True,
+                    "subscription": subscription,
+                }), 200
             logger.warning("verify_password : mot de passe incorrect pour école='%s'", school_code)
             return jsonify({
                 "valid": False, "error": "Mot de passe incorrect"
@@ -1258,6 +1416,204 @@ def verify_password():
         return jsonify({"error": "Aucune sauvegarde trouvée"}), 404
     except Exception as e:
         logger.exception("Erreur verify_password")
+        return jsonify({"error": str(e)}), 500
+
+
+# ====================================================================
+# ⚡⚡⚡ NOUVEAU — ROUTES ABONNEMENT / CLÉ DE RECONNEXION
+# ====================================================================
+# Trois routes :
+#   1) /school/check_subscription       (public, GET)   — l'appli
+#      interroge l'état d'abonnement d'une école, sans mot de passe
+#      (comme /restore).
+#   2) /admin/generate_reconnection_key (admin, POST)    — génère une
+#      clé à usage unique pour une école, à transmettre par
+#      téléphone/WhatsApp à l'école concernée.
+#   3) /school/redeem_reconnection_key  (public, POST)   — l'appli
+#      envoie la clé saisie par l'utilisateur ; si elle est valide,
+#      une nouvelle période d'abonnement démarre immédiatement.
+# ====================================================================
+
+@app.route('/school/check_subscription', methods=['GET'])
+def check_subscription():
+    """
+    Appelée par l'application :
+      - au démarrage, si une connexion internet est disponible, pour
+        rafraîchir le cache local (SubscriptionService) ;
+      - surtout, lors d'une connexion sur un NOUVEL appareil avec code
+        école + mot de passe (voir aussi /verify_password qui renvoie
+        déjà cette même information).
+    Ne nécessite aucun mot de passe : le school_code seul suffit,
+    exactement comme /restore.
+    """
+    try:
+        school_code = request.args.get('school_code', '').strip()
+        if not school_code:
+            return jsonify({"error": "Code manquant"}), 400
+        _, school = _find_school_entry(school_code)
+        if not school:
+            logger.warning("check_subscription : école introuvable code='%s'", school_code)
+            return jsonify({"error": "École introuvable"}), 404
+        status = _compute_subscription_status(school)
+        logger.info(
+            "check_subscription : école='%s' valide=%s restant=%ss",
+            school_code, status['valid'], status.get('seconds_remaining'),
+        )
+        return jsonify(status), 200
+    except Exception as e:
+        logger.exception("Erreur check_subscription")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/admin/generate_reconnection_key', methods=['POST'])
+def generate_reconnection_key():
+    """
+    Réservée à l'admin (mot de passe admin requis). Génère une clé de
+    reconnexion à usage unique pour une école donnée. Cette clé, une
+    fois transmise à l'école et saisie dans l'appli (écran "Abonnement
+    expiré"), redémarre immédiatement une période d'abonnement complète
+    pour cette école (60 secondes en mode test, 30 jours en production).
+    """
+    try:
+        data = request.get_json()
+        if data.get('admin_password') != ADMIN_PASSWORD:
+            logger.warning("generate_reconnection_key : mot de passe admin incorrect")
+            return jsonify({"error": "Mot de passe admin incorrect"}), 401
+
+        school_code = (data.get('school_code') or '').strip()
+        if not school_code:
+            return jsonify({"error": "Code école manquant"}), 400
+
+        real_code, school = _find_school_entry(school_code)
+        if not school:
+            return jsonify({"error": "École introuvable"}), 404
+
+        key = _generate_reconnection_key_str()
+        keys_store      = _load_json(SUBSCRIPTION_KEYS_FILE, {})
+        # Sécurité : s'assurer qu'on ne génère jamais deux fois la même
+        # clé (extrêmement improbable vu l'espace de génération, mais
+        # gratuit à vérifier).
+        while key in keys_store:
+            key = _generate_reconnection_key_str()
+
+        keys_store[key] = {
+            "school_code": real_code,
+            "school_name": school.get('school_name'),
+            "created_at":  datetime.datetime.now().isoformat(),
+            "used":        False,
+            "used_at":     None,
+        }
+        _save_json(SUBSCRIPTION_KEYS_FILE, keys_store)
+
+        logger.info(
+            "🔑 generate_reconnection_key : école='%s' → clé générée='%s'",
+            real_code, key,
+        )
+
+        return jsonify({
+            "key":         key,
+            "school_code": real_code,
+            "school_name": school.get('school_name'),
+        }), 200
+    except Exception as e:
+        logger.exception("Erreur generate_reconnection_key")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/school/redeem_reconnection_key', methods=['POST'])
+def redeem_reconnection_key():
+    """
+    Appelée par l'application quand l'utilisateur saisit, dans l'écran
+    "Abonnement expiré", la clé fournie par l'administrateur EduPay.
+    Si la clé est valide, non utilisée, et correspond bien à l'école
+    concernée, une nouvelle période d'abonnement démarre immédiatement
+    et la clé est marquée comme consommée (usage unique).
+    """
+    try:
+        data        = request.get_json()
+        school_code = (data.get('school_code') or '').strip()
+        key         = (data.get('key') or '').strip().upper()
+
+        if not school_code or not key:
+            return jsonify({"error": "Données manquantes"}), 400
+
+        real_code, school = _find_school_entry(school_code)
+        if not school:
+            return jsonify({"error": "École introuvable"}), 404
+
+        keys_store = _load_json(SUBSCRIPTION_KEYS_FILE, {})
+        key_info   = keys_store.get(key)
+
+        if not key_info:
+            logger.warning(
+                "redeem_reconnection_key : clé introuvable pour école='%s'",
+                school_code,
+            )
+            return jsonify({"error": "Clé de reconnexion invalide"}), 404
+
+        if key_info.get('used'):
+            logger.warning(
+                "redeem_reconnection_key : clé déjà utilisée (école='%s')",
+                school_code,
+            )
+            return jsonify({"error": "Cette clé a déjà été utilisée"}), 400
+
+        if key_info.get('school_code', '').upper() != real_code.upper():
+            logger.warning(
+                "redeem_reconnection_key : clé ne correspond pas à l'école='%s'",
+                school_code,
+            )
+            return jsonify({
+                "error": "Cette clé ne correspond pas à cette école"
+            }), 400
+
+        # Tout est valide : on redémarre une période complète et on
+        # marque la clé comme consommée.
+        schools = _load_json(SCHOOLS_FILE, {})
+        _start_new_subscription_period(schools[real_code])
+        _save_json(SCHOOLS_FILE, schools)
+
+        key_info['used']    = True
+        key_info['used_at'] = datetime.datetime.now().isoformat()
+        keys_store[key]     = key_info
+        _save_json(SUBSCRIPTION_KEYS_FILE, keys_store)
+
+        logger.info(
+            "✅ redeem_reconnection_key : école='%s' réactivée jusqu'à '%s'",
+            real_code, schools[real_code].get('subscription_expires_at'),
+        )
+
+        return jsonify({
+            "message":    "Abonnement réactivé avec succès",
+            "expires_at": schools[real_code].get('subscription_expires_at'),
+        }), 200
+    except Exception as e:
+        logger.exception("Erreur redeem_reconnection_key")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/admin/list_reconnection_keys', methods=['POST'])
+def list_reconnection_keys():
+    """
+    Réservée à l'admin. Renvoie l'historique des clés de reconnexion
+    générées (utilisées ou non), avec un filtre optionnel par école —
+    pratique pour l'onglet "Historique" de l'interface admin.
+    """
+    try:
+        data = request.get_json()
+        if data.get('admin_password') != ADMIN_PASSWORD:
+            return jsonify({"error": "Accès refusé"}), 401
+        school_code = (data.get('school_code') or '').strip()
+        keys_store  = _load_json(SUBSCRIPTION_KEYS_FILE, {})
+        result = [
+            {"key": k, **v}
+            for k, v in keys_store.items()
+            if not school_code or v.get('school_code', '').upper() == school_code.upper()
+        ]
+        result.sort(key=lambda x: x.get('created_at', ''), reverse=True)
+        return jsonify({"keys": result, "total": len(result)}), 200
+    except Exception as e:
+        logger.exception("Erreur list_reconnection_keys")
         return jsonify({"error": str(e)}), 500
 
 
@@ -2192,6 +2548,8 @@ def admin_health():
             "data_dir":        os.path.abspath(DATA_DIR),
             "nb_ecoles":       len(details),
             "ecoles":          details,
+            # ⚡⚡⚡ NOUVEAU — visible d'un coup d'œil dans /admin/health
+            "subscription_mode": "TEST (1 minute)" if SUBSCRIPTION_TEST_MODE else "PRODUCTION (30 jours)",
         }), 200
     except Exception as e:
         logger.exception("Erreur admin_health")
