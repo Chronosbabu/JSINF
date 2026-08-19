@@ -13,25 +13,6 @@ app = Flask(__name__)
 # ====================================================================
 # ⚡⚡⚡ NOUVEAU — STOCKAGE SUR DISQUE PERSISTANT RENDER
 # ====================================================================
-# Vous avez ajouté un disque persistant Render (1 Go) monté sur le
-# chemin /var/data. Tant que ce disque est attaché au service, tout ce
-# qui est écrit dans ce dossier survit aux redéploiements, redémarrages
-# et mises à jour du serveur — contrairement au disque local du
-# conteneur (éphémère), qui est effacé à chaque déploiement.
-#
-# DATA_DIR pointe maintenant vers un sous-dossier "school_data" DANS
-# le disque persistant (/var/data/school_data), pour garder toutes vos
-# données bien organisées à l'intérieur du point de montage.
-#
-# Vous pouvez surcharger ce chemin via la variable d'environnement
-# DATA_DIR si besoin (utile pour tester en local sans le disque Render
-# monté), sinon la valeur par défaut est bien /var/data/school_data.
-#
-# ⚠️ IMPORTANT côté Render : le "Mount Path" du disque doit être
-# /var/data (exactement ce que vous avez indiqué), et ce disque doit
-# être attaché à CE service précis. Rien d'autre à faire côté code :
-# os.makedirs(DATA_DIR, exist_ok=True) ci-dessous crée automatiquement
-# le sous-dossier school_data au premier démarrage si besoin.
 DATA_DIR = os.environ.get("DATA_DIR", "/var/data/school_data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -40,13 +21,10 @@ IDS_FILE                   = os.path.join(DATA_DIR, "ids_store.json")
 PENDING_FILE                = os.path.join(DATA_DIR, "pending_payments.json")
 MOBILE_PAYMENTS_FILE        = os.path.join(DATA_DIR, "mobile_payments.json")
 SCHOOLS_FILE                = os.path.join(DATA_DIR, "schools_registry.json")
-# ⚡ NOUVEAU — Module Discipline
 ATTENDANCE_FILE             = os.path.join(DATA_DIR, "attendance_records.json")
 MESSAGES_FILE                = os.path.join(DATA_DIR, "parent_messages.json")
-# ⚡⚡ NOUVEAU — Clés multi-usages : inscriptions et autres frais en attente
 PENDING_REGISTRATIONS_FILE  = os.path.join(DATA_DIR, "pending_registrations.json")
 PENDING_AUTRES_FRAIS_FILE   = os.path.join(DATA_DIR, "pending_autres_frais.json")
-# ⚡⚡⚡ NOUVEAU — Système d'abonnement / clés de reconnexion
 SUBSCRIPTION_KEYS_FILE      = os.path.join(DATA_DIR, "subscription_keys.json")
 
 ADMIN_PASSWORD = "edupay_admin_2026"
@@ -58,21 +36,6 @@ ORANGE_API_KEY      = os.environ.get('ORANGE_API_KEY', '')
 VODACOM_MERCHANT_ID = os.environ.get('VODACOM_MERCHANT_ID', '')
 VODACOM_API_KEY     = os.environ.get('VODACOM_API_KEY', '')
 
-# ====================================================================
-# ⚡⚡⚡ NOUVEAU — GESTION DE L'ABONNEMENT (LICENCE)
-# ====================================================================
-# Chaque école dispose d'une période d'abonnement qui démarre au moment
-# de son activation (/school/activate) et qui est redémarrée à chaque
-# fois qu'une CLÉ DE RECONNEXION valide (générée par l'admin depuis
-# admin_panel.py) est consommée via /school/redeem_reconnection_key.
-#
-# ⚡ MODE TEST : la durée est fixée à 60 secondes (1 minute), comme
-# demandé, pour pouvoir tester rapidement tout le scénario complet
-# (activation -> expiration -> clé de reconnexion -> nouvel accès).
-#
-# 🚀 POUR LA PRODUCTION : il suffit de mettre SUBSCRIPTION_TEST_MODE à
-# False ci-dessous. La durée passera automatiquement à 30 jours, sans
-# rien changer d'autre dans le code.
 SUBSCRIPTION_TEST_MODE = True
 SUBSCRIPTION_DURATION_SECONDS = 60 if SUBSCRIPTION_TEST_MODE else 30 * 24 * 60 * 60
 
@@ -81,19 +44,8 @@ MONTHS = [
     'Janvier', 'Fevrier', 'Mars', 'Avril', 'Mai', 'Juin'
 ]
 
-# ⚡⚡ NOUVEAU — Types d'accès possibles pour une clé générée par l'admin.
-# PAY  = paiement des frais scolaires mensuels (comportement historique)
-# DISC = discipline (absences, convocations, communiqués)
-# INSC = inscription de nouveaux élèves
-# AFR  = paiement des "autres frais" (frais ponctuels/annexes)
 KEY_TYPES = {'PAY', 'DISC', 'INSC', 'AFR'}
 
-# ⚡ Liste centrale des fichiers "système" (non-écoles) à exclure de tout
-# scan de dossier qui s'attend à ne trouver que des fichiers école.
-# IMPORTANT : chaque nouveau fichier de stockage global (comme
-# ATTENDANCE_FILE et MESSAGES_FILE ci-dessus) DOIT être ajouté ici,
-# sinon il sera scanné à tort comme un fichier école par parent_find_student,
-# _get_all_ids_except, _auto_confirm_payment, admin_health, etc.
 SYSTEM_FILES = {
     'keys_store.json', 'ids_store.json',
     'pending_payments.json', 'mobile_payments.json',
@@ -103,9 +55,6 @@ SYSTEM_FILES = {
     'subscription_keys.json',
 }
 
-# ====================================================================
-# ⚡ CONFIGURATION DES LOGS
-# ====================================================================
 logging.basicConfig(
     level=logging.INFO,
     format='[%(asctime)s] %(levelname)s %(name)s: %(message)s',
@@ -246,8 +195,6 @@ def mobile_money_available():
 # ====================================================================
 
 def _find_school_entry(school_code):
-    """Recherche insensible à la casse d'une école dans le registre.
-    Renvoie (code_reel, dict_ecole) ou (None, None) si introuvable."""
     if not school_code:
         return None, None
     schools = _load_json(SCHOOLS_FILE, {})
@@ -265,11 +212,6 @@ def _generate_reconnection_key_str():
 
 
 def _start_new_subscription_period(school):
-    """Démarre (ou redémarre) une période d'abonnement complète pour
-    l'école donnée : maintenant -> maintenant + SUBSCRIPTION_DURATION_SECONDS.
-    Modifie le dict `school` EN PLACE (celui-ci doit provenir d'un
-    dictionnaire chargé depuis SCHOOLS_FILE, pour que la modification
-    soit bien sauvegardée par l'appelant via _save_json)."""
     now     = datetime.datetime.now()
     expires = now + datetime.timedelta(seconds=SUBSCRIPTION_DURATION_SECONDS)
     school['subscription_started_at'] = now.isoformat()
@@ -279,11 +221,6 @@ def _start_new_subscription_period(school):
 
 
 def _compute_subscription_status(school):
-    """Calcule l'état d'abonnement d'une école à partir de son entrée
-    dans le registre central. Ne renvoie jamais None : une école sans
-    aucune information d'abonnement (compte créé avant l'introduction
-    de cette fonctionnalité) est considérée VALIDE par défaut, pour ne
-    jamais bloquer rétroactivement un compte existant."""
     if not school:
         return {
             "valid":             False,
@@ -430,10 +367,6 @@ def admin_register_school():
             "activated":       False,
             "registered_at":   datetime.datetime.now().isoformat(),
             "activated_at":    None,
-            # ⚡⚡⚡ NOUVEAU — champs d'abonnement, remplis réellement à
-            # l'activation (voir /school/activate). Laissés vides ici
-            # pour qu'une école non encore activée ne soit jamais
-            # comptée comme "expirée".
             "subscription_started_at": None,
             "subscription_expires_at": None,
             "subscription_blocked":    False,
@@ -562,9 +495,6 @@ def activate_school():
 
         schools[target_code]['activated']    = True
         schools[target_code]['activated_at'] = datetime.datetime.now().isoformat()
-        # ⚡⚡⚡ NOUVEAU — démarre la période d'abonnement de l'école dès
-        # son activation (voir SUBSCRIPTION_DURATION_SECONDS en haut du
-        # fichier : 1 minute en mode test, 30 jours en production).
         _start_new_subscription_period(schools[target_code])
         _save_json(SCHOOLS_FILE, schools)
 
@@ -615,8 +545,6 @@ def activate_school():
             "message":     "Compte activé avec succès. Bienvenue sur EduPay !",
             "school_code": target_code,
             "school_name": final_name,
-            # ⚡⚡⚡ NOUVEAU — permet au client Flutter d'initialiser tout
-            # de suite son cache local d'abonnement (SubscriptionService).
             "subscription_expires_at": schools[target_code].get('subscription_expires_at'),
             "subscription_seconds":    SUBSCRIPTION_DURATION_SECONDS,
         }), 200
@@ -640,9 +568,6 @@ def list_schools():
             "activated":     s.get('activated', False),
             "registered_at": s.get('registered_at'),
             "activated_at":  s.get('activated_at'),
-            # ⚡⚡⚡ NOUVEAU — état d'abonnement complet, utilisé par
-            # l'interface admin (admin_panel.py) pour afficher qui est
-            # en règle et qui a besoin d'une clé de reconnexion.
             "subscription":  _compute_subscription_status(s),
         } for sc, s in schools.items()]
         logger.info("list_schools : %d école(s) enregistrée(s)", len(summary))
@@ -689,10 +614,6 @@ def backup():
             school_code, filepath, file_size, len(corrections),
         )
 
-        # ⚡⚡⚡ NOUVEAU — on joint l'état de l'abonnement à la réponse du
-        # backup : c'est un des moments où l'appli a forcément internet,
-        # donc l'occasion idéale de rafraîchir le cache local côté
-        # client (SubscriptionService.applyServerSubscription).
         _, school_entry = _find_school_entry(school_code)
         return jsonify({
             "message":      "Sauvegarde réussie",
@@ -724,9 +645,6 @@ def restore():
             school_code, nb_eleves,
         )
         data.pop('backup_password', None)
-        # ⚡⚡⚡ NOUVEAU — état d'abonnement inclus dans la restauration,
-        # pour que le client rafraîchisse son cache local dès qu'il a
-        # internet (utile notamment lors d'une restauration classique).
         _, school_entry = _find_school_entry(school_code)
         data['subscription'] = _compute_subscription_status(school_entry)
         return jsonify(data), 200
@@ -1415,13 +1333,6 @@ def verify_password():
             with open(filepath, 'r', encoding='utf-8') as f:
                 saved_data = json.load(f)
             if saved_data.get('backup_password') == password:
-                # ⚡⚡⚡ NOUVEAU — on joint l'état de l'abonnement à la
-                # réponse de connexion. C'est LE moment clé : quand un
-                # utilisateur se connecte depuis un NOUVEL ordinateur
-                # avec code école + mot de passe, c'est ici que le
-                # serveur détermine s'il faut le rediriger vers l'écran
-                # "Abonnement expiré" (le client Flutter lit
-                # `subscription.valid`).
                 _, school_entry = _find_school_entry(school_code)
                 subscription = _compute_subscription_status(school_entry)
                 logger.info(
@@ -1446,30 +1357,9 @@ def verify_password():
 # ====================================================================
 # ⚡⚡⚡ NOUVEAU — ROUTES ABONNEMENT / CLÉ DE RECONNEXION
 # ====================================================================
-# Trois routes :
-#   1) /school/check_subscription       (public, GET)   — l'appli
-#      interroge l'état d'abonnement d'une école, sans mot de passe
-#      (comme /restore).
-#   2) /admin/generate_reconnection_key (admin, POST)    — génère une
-#      clé à usage unique pour une école, à transmettre par
-#      téléphone/WhatsApp à l'école concernée.
-#   3) /school/redeem_reconnection_key  (public, POST)   — l'appli
-#      envoie la clé saisie par l'utilisateur ; si elle est valide,
-#      une nouvelle période d'abonnement démarre immédiatement.
-# ====================================================================
 
 @app.route('/school/check_subscription', methods=['GET'])
 def check_subscription():
-    """
-    Appelée par l'application :
-      - au démarrage, si une connexion internet est disponible, pour
-        rafraîchir le cache local (SubscriptionService) ;
-      - surtout, lors d'une connexion sur un NOUVEL appareil avec code
-        école + mot de passe (voir aussi /verify_password qui renvoie
-        déjà cette même information).
-    Ne nécessite aucun mot de passe : le school_code seul suffit,
-    exactement comme /restore.
-    """
     try:
         school_code = request.args.get('school_code', '').strip()
         if not school_code:
@@ -1491,13 +1381,6 @@ def check_subscription():
 
 @app.route('/admin/generate_reconnection_key', methods=['POST'])
 def generate_reconnection_key():
-    """
-    Réservée à l'admin (mot de passe admin requis). Génère une clé de
-    reconnexion à usage unique pour une école donnée. Cette clé, une
-    fois transmise à l'école et saisie dans l'appli (écran "Abonnement
-    expiré"), redémarre immédiatement une période d'abonnement complète
-    pour cette école (60 secondes en mode test, 30 jours en production).
-    """
     try:
         data = request.get_json()
         if data.get('admin_password') != ADMIN_PASSWORD:
@@ -1514,9 +1397,6 @@ def generate_reconnection_key():
 
         key = _generate_reconnection_key_str()
         keys_store      = _load_json(SUBSCRIPTION_KEYS_FILE, {})
-        # Sécurité : s'assurer qu'on ne génère jamais deux fois la même
-        # clé (extrêmement improbable vu l'espace de génération, mais
-        # gratuit à vérifier).
         while key in keys_store:
             key = _generate_reconnection_key_str()
 
@@ -1546,13 +1426,6 @@ def generate_reconnection_key():
 
 @app.route('/school/redeem_reconnection_key', methods=['POST'])
 def redeem_reconnection_key():
-    """
-    Appelée par l'application quand l'utilisateur saisit, dans l'écran
-    "Abonnement expiré", la clé fournie par l'administrateur EduPay.
-    Si la clé est valide, non utilisée, et correspond bien à l'école
-    concernée, une nouvelle période d'abonnement démarre immédiatement
-    et la clé est marquée comme consommée (usage unique).
-    """
     try:
         data        = request.get_json()
         school_code = (data.get('school_code') or '').strip()
@@ -1591,8 +1464,6 @@ def redeem_reconnection_key():
                 "error": "Cette clé ne correspond pas à cette école"
             }), 400
 
-        # Tout est valide : on redémarre une période complète et on
-        # marque la clé comme consommée.
         schools = _load_json(SCHOOLS_FILE, {})
         _start_new_subscription_period(schools[real_code])
         _save_json(SCHOOLS_FILE, schools)
@@ -1618,11 +1489,6 @@ def redeem_reconnection_key():
 
 @app.route('/admin/list_reconnection_keys', methods=['POST'])
 def list_reconnection_keys():
-    """
-    Réservée à l'admin. Renvoie l'historique des clés de reconnexion
-    générées (utilisées ou non), avec un filtre optionnel par école —
-    pratique pour l'onglet "Historique" de l'interface admin.
-    """
     try:
         data = request.get_json()
         if data.get('admin_password') != ADMIN_PASSWORD:
@@ -1642,26 +1508,54 @@ def list_reconnection_keys():
 
 
 # ====================================================================
-# ⚡⚡ NOUVEAU — CLÉS D'ACCÈS MULTI-USAGES
+# ⚡⚡⚡ NOUVEAU — CLÉS D'ACCÈS MULTI-USAGES ET MULTI-SECTIONS
 # ====================================================================
 # Une clé encode désormais 4 informations :
 #   - school_code : l'école concernée
 #   - type        : PAY | DISC | INSC | AFR (ce que le sous-utilisateur
 #                   peut faire une fois connecté avec cette clé)
-#   - section     : la section sur laquelle il travaille
-#   - classe      : soit une classe précise, soit None/"" pour signifier
-#                   "toutes les classes de la section"
-# Le format texte de la clé reste lisible par un humain, à des fins de
-# debug/support : SCHOOLCODE*TYPE*SEC*CLASSE*alea
-# (CLASSE vaut littéralement "ALL" quand aucune classe n'est précisée)
+#   - sections    : UNE LISTE d'une ou plusieurs sections/options sur
+#                   lesquelles il peut travailler et BASCULER librement
+#                   une fois connecté (ex: ["Primaire", "Secondaire"])
+#   - classe      : une classe précise, UNIQUEMENT possible quand une
+#                   seule section est choisie (sinon toujours None, car
+#                   une classe n'appartient qu'à une seule section) —
+#                   None/"" = "toutes les classes de la/les section(s)"
+#
+# ⚡ RÉTROCOMPATIBILITÉ : les anciennes clés stockées avant cette
+# évolution n'ont qu'un champ "section" (chaîne) au lieu de "sections"
+# (liste). _key_sections() ci-dessous normalise les deux formats afin
+# que verify_key/list_keys continuent de fonctionner pour les clés déjà
+# distribuées, sans avoir à les régénérer.
 # ====================================================================
+
+def _key_sections(info):
+    """Renvoie toujours une LISTE de sections à partir d'une entrée de
+    clé, qu'elle ait été enregistrée à l'ancien format ('section': str)
+    ou au nouveau format ('sections': list)."""
+    if info.get('sections'):
+        return list(info['sections'])
+    single = info.get('section')
+    return [single] if single else []
+
 
 def _slug(value, max_len=12):
     """Réduit une chaîne à des caractères alphanumériques, en majuscules,
-    pour l'insérer proprement dans la clé texte (la classe peut contenir
-    des espaces, accents, etc. ex: '6ème A')."""
+    pour l'insérer proprement dans la clé texte (la section/classe peut
+    contenir des espaces, accents, etc. ex: '6ème A')."""
     cleaned = re.sub(r'[^A-Za-z0-9]', '', value or '')
     return cleaned.upper()[:max_len] if cleaned else "ALL"
+
+
+def _sections_slug(sections):
+    """Partie lisible de la clé texte représentant les sections
+    choisies : les 3 premières lettres de chacune, jointes par '+',
+    tronquée si trop de sections sont sélectionnées d'un coup."""
+    if not sections:
+        return "ALL"
+    parts = [s.upper()[:3] for s in sections if s]
+    joined = '+'.join(parts)
+    return joined[:24] if joined else "ALL"
 
 
 @app.route('/generate_key', methods=['POST'])
@@ -1669,16 +1563,34 @@ def generate_key():
     try:
         data        = request.get_json()
         school_code = data.get('school_code')
-        section     = data.get('section')
-        # ⚡⚡ NOUVEAU — type d'accès. 'PAY' par défaut pour rester
-        # compatible avec d'anciens clients qui n'enverraient pas ce champ.
-        key_type    = (data.get('type') or 'PAY').strip().upper()
-        # ⚡⚡ NOUVEAU — classe ciblée, ou vide/None = toutes les classes
-        # de la section.
-        classe      = (data.get('classe') or '').strip()
 
-        if not school_code or not section:
-            return jsonify({"error": "Données manquantes"}), 400
+        # ⚡⚡⚡ NOUVEAU — accepte une LISTE de sections ('sections'), tout
+        # en restant rétrocompatible avec l'ancien champ unique
+        # ('section') si jamais un ancien client l'envoie encore.
+        sections_raw = data.get('sections')
+        if sections_raw is None:
+            single_section = data.get('section')
+            sections_raw = [single_section] if single_section else []
+        sections = [s.strip() for s in sections_raw if s and s.strip()]
+        # On élimine les doublons tout en gardant l'ordre de sélection
+        # choisi par l'admin (plus intuitif pour lui à la relecture).
+        seen = set()
+        sections = [s for s in sections if not (s in seen or seen.add(s))]
+
+        key_type = (data.get('type') or 'PAY').strip().upper()
+
+        # La classe n'a de sens QUE si une seule section est ciblée :
+        # une classe appartient à une seule section. Dès que plusieurs
+        # sections sont sélectionnées, on ignore toute classe fournie
+        # et la clé donne accès à "toutes les classes" de chacune.
+        classe = (data.get('classe') or '').strip()
+        if len(sections) != 1:
+            classe = ''
+
+        if not school_code or not sections:
+            return jsonify({
+                "error": "École et au moins une section sont requis"
+            }), 400
 
         if key_type not in KEY_TYPES:
             return jsonify({
@@ -1687,27 +1599,34 @@ def generate_key():
             }), 400
 
         key = (
-            f"{school_code.upper()}*{key_type}*{section.upper()[:3]}"
+            f"{school_code.upper()}*{key_type}*{_sections_slug(sections)}"
             f"*{_slug(classe)}*{os.urandom(4).hex()}"
         )
         keys      = _load_json(KEYS_FILE, {})
         keys[key] = {
             "school_code": school_code,
-            "section":     section,
+            # ⚡⚡⚡ NOUVEAU — la liste complète des sections accessibles
+            # avec cette clé (le sous-utilisateur pourra basculer entre
+            # elles librement une fois connecté).
+            "sections":    sections,
+            # Champ conservé pour compatibilité avec un éventuel ancien
+            # code qui lirait encore 'section' (toujours la 1ère de la
+            # liste) — non utilisé par le nouveau client.
+            "section":     sections[0],
             "type":        key_type,
-            # None = toutes les classes de la section
             "classe":      classe if classe else None,
         }
         _save_json(KEYS_FILE, keys)
         logger.info(
-            "🔑 generate_key : école='%s' type='%s' section='%s' classe='%s' → clé générée",
-            school_code, key_type, section, classe or "TOUTES",
+            "🔑 generate_key : école='%s' type='%s' sections=%s classe='%s' → clé générée",
+            school_code, key_type, sections, classe or "TOUTES",
         )
         return jsonify({
-            "key":     key,
-            "section": section,
-            "type":    key_type,
-            "classe":  classe or None,
+            "key":      key,
+            "sections": sections,
+            "section":  sections[0],
+            "type":     key_type,
+            "classe":   classe or None,
         }), 200
     except Exception as e:
         logger.exception("Erreur generate_key")
@@ -1727,6 +1646,7 @@ def verify_key():
             logger.warning("verify_key : clé invalide/introuvable")
             return jsonify({"valid": False, "error": "Clé invalide"}), 404
         school_code  = info["school_code"]
+        sections     = _key_sections(info)
         filepath     = os.path.join(DATA_DIR, f"{school_code.lower()}.json")
         school_name  = school_code
         current_year = None
@@ -1736,17 +1656,21 @@ def verify_key():
             school_name  = saved.get('config', {}).get('schoolName', school_code)
             current_year = saved.get('currentYear')
         logger.info(
-            "verify_key : clé valide pour école='%s' type='%s' section='%s' classe='%s'",
-            school_code, info.get('type', 'PAY'), info["section"], info.get('classe'),
+            "verify_key : clé valide pour école='%s' type='%s' sections=%s classe='%s'",
+            school_code, info.get('type', 'PAY'), sections, info.get('classe'),
         )
         return jsonify({
             "valid":        True,
             "school_code":  school_code,
-            "section":      info["section"],
-            # ⚡⚡ NOUVEAU — anciennes clés déjà en circulation sans 'type' :
-            # on retombe sur 'PAY' pour ne rien casser.
+            # ⚡⚡⚡ NOUVEAU — la liste complète des sections que le client
+            # peut désormais proposer dans un sélecteur/bascule.
+            "sections":     sections,
+            # Conservé pour compatibilité (1ère section de la liste).
+            "section":      sections[0] if sections else None,
             "type":         info.get("type", "PAY"),
-            "classe":       info.get("classe"),  # None = toutes les classes
+            # La classe n'est renvoyée que si la clé est verrouillée sur
+            # UNE SEULE section — sinon toujours None (toutes classes).
+            "classe":       info.get("classe") if len(sections) == 1 else None,
             "school_name":  school_name,
             "current_year": current_year,
         }), 200
@@ -1775,9 +1699,9 @@ def revoke_key():
 
 @app.route('/list_keys', methods=['GET'])
 def list_keys():
-    """⚡⚡ NOUVEAU — Liste toutes les clés actives d'une école, pour que
+    """⚡⚡⚡ NOUVEAU — Liste toutes les clés actives d'une école, pour que
     l'admin puisse voir/gérer (et révoquer) les clés déjà distribuées,
-    avec leur type, section et classe."""
+    avec leur type, LEURS sections (liste) et classe."""
     try:
         school_code = request.args.get('school_code')
         if not school_code:
@@ -1785,10 +1709,10 @@ def list_keys():
         keys   = _load_json(KEYS_FILE, {})
         result = [
             {
-                "key":     k,
-                "type":    v.get("type", "PAY"),
-                "section": v.get("section"),
-                "classe":  v.get("classe"),
+                "key":      k,
+                "type":     v.get("type", "PAY"),
+                "sections": _key_sections(v),
+                "classe":   v.get("classe"),
             }
             for k, v in keys.items()
             if v.get("school_code") == school_code
@@ -1848,12 +1772,7 @@ def generate_student_id():
 
 
 # ====================================================================
-# ⚡⚡ NOUVEAU — INSCRIPTIONS EN ATTENTE (clé de type INSC)
-# Même philosophie que les paiements : le sous-utilisateur (agent chargé
-# des inscriptions) soumet une fiche élève, qui reste "en attente" tant
-# que l'admin ne l'a pas validée depuis admin_dashboard_screen.dart. Cela
-# évite les doublons/erreurs de saisie directement dans les données
-# officielles de l'école.
+# ⚡⚡ INSCRIPTIONS EN ATTENTE (clé de type INSC)
 # ====================================================================
 
 @app.route('/school/submit_registration', methods=['POST'])
@@ -2040,11 +1959,7 @@ def reject_registration():
 
 
 # ====================================================================
-# ⚡⚡ NOUVEAU — AUTRES FRAIS (clé de type AFR)
-# Consultation des "autres frais" existants (créés par l'admin depuis
-# Paramètres) et soumission de paiements, également en file d'attente
-# de validation — même logique que /record_payment pour les frais
-# mensuels.
+# ⚡⚡ AUTRES FRAIS (clé de type AFR)
 # ====================================================================
 
 @app.route('/school/get_autres_frais', methods=['GET'])
@@ -2238,25 +2153,7 @@ def reject_autre_frais_payment():
 
 
 # ====================================================================
-# ⚡ NOUVEAU — MODULE DISCIPLINE (clé de type DISC)
-# Trois briques :
-#   1) Absences : le directeur de discipline coche les élèves absents
-#      pour une classe/date, on enregistre le registre ET on notifie
-#      automatiquement chaque parent concerné.
-#   2) Convocations : message individuel envoyé à un parent (mauvais
-#      comportement, etc.), rédigé librement par l'école.
-#   3) Communiqués : message envoyé à un groupe de parents (élèves
-#      sélectionnés, une classe, une section, ou toute l'école).
-# Tous ces messages sont stockés dans MESSAGES_FILE, une entrée par
-# élève ciblé, ce qui permet à l'appli parent de tout récupérer via
-# une seule route (/parent/get_messages) filtrée par élève.
-# ⚡⚡ Ces routes sont désormais aussi appelées par le sous-utilisateur
-# détenteur d'une clé de type DISC (verrouillée sur une section/classe),
-# exactement comme l'admin les appelle depuis discipline_registre_screen.dart
-# et communique_screen.dart — aucune modification nécessaire ici.
-# La synchronisation côté parent se fait par sondage périodique
-# (polling) — pas de websocket sur cet hébergement — ce qui donne un
-# effet quasi temps-réel amplement suffisant pour ce cas d'usage.
+# ⚡ MODULE DISCIPLINE (clé de type DISC)
 # ====================================================================
 
 def _new_message_id():
@@ -2287,11 +2184,6 @@ def _add_message_for_student(school_code, student_id, msg_type, title, message, 
 
 @app.route('/school/record_absences', methods=['POST'])
 def record_absences():
-    """
-    Enregistre les absences d'une classe pour une date donnée (registre
-    de discipline) et notifie automatiquement le parent de chaque élève
-    coché comme absent.
-    """
     try:
         data           = request.get_json()
         school_code    = data.get('school_code')
@@ -2363,11 +2255,6 @@ def record_absences():
 
 @app.route('/school/get_attendance', methods=['GET'])
 def get_attendance():
-    """
-    Renvoie le registre déjà enregistré pour une classe/date donnée
-    (utile pour rouvrir le registre du jour sans perdre les cases déjà
-    cochées).
-    """
     try:
         school_code = request.args.get('school_code')
         date_str    = request.args.get('date') or datetime.date.today().isoformat()
@@ -2386,10 +2273,6 @@ def get_attendance():
 
 @app.route('/school/send_convocation', methods=['POST'])
 def send_convocation():
-    """
-    Envoie un message de convocation à un parent (comportement,
-    discipline...). Le texte est rédigé librement par l'école.
-    """
     try:
         data        = request.get_json()
         school_code = data.get('school_code')
@@ -2415,13 +2298,6 @@ def send_convocation():
 
 @app.route('/school/send_announcement', methods=['POST'])
 def send_announcement():
-    """
-    Envoie un communiqué aux parents. Ciblage :
-      - target = "students" + student_ids = [...]
-      - target = "classe"   + classe = "..."
-      - target = "section"  + section = "..."
-      - target = "all"      (toute l'école)
-    """
     try:
         data        = request.get_json()
         school_code = data.get('school_code')
@@ -2432,6 +2308,10 @@ def send_announcement():
         student_ids = data.get('student_ids', [])
         classe      = data.get('classe', '')
         section     = data.get('section', '')
+        # ⚡⚡⚡ NOUVEAU — cible multi-sections, quand le sous-utilisateur
+        # (ou l'admin) veut viser plusieurs sections d'un coup depuis une
+        # clé qui en couvre plusieurs.
+        sections    = data.get('sections') or ([section] if section else [])
 
         if not school_code or not annee or not message:
             return jsonify({"error": "Données manquantes"}), 400
@@ -2450,6 +2330,8 @@ def send_announcement():
             targeted = [e for e in eleves if e.get('classe') == classe]
         elif target == 'section':
             targeted = [e for e in eleves if e.get('section') == section]
+        elif target == 'sections':
+            targeted = [e for e in eleves if e.get('section') in sections]
         else:
             targeted = eleves
 
@@ -2479,12 +2361,6 @@ def send_announcement():
 
 @app.route('/parent/get_messages', methods=['GET'])
 def parent_get_messages():
-    """
-    Récupère tous les messages (absences, convocations, communiqués)
-    liés à un élève donné, du plus récent au plus ancien, avec le
-    nombre de messages non lus. Appelée par l'appli parent en boucle
-    (sondage périodique) pour simuler le temps réel.
-    """
     try:
         student_id  = request.args.get('student_id', '').strip().upper()
         school_code = request.args.get('school_code', '').strip()
@@ -2572,7 +2448,6 @@ def admin_health():
             "data_dir":        os.path.abspath(DATA_DIR),
             "nb_ecoles":       len(details),
             "ecoles":          details,
-            # ⚡⚡⚡ NOUVEAU — visible d'un coup d'œil dans /admin/health
             "subscription_mode": "TEST (1 minute)" if SUBSCRIPTION_TEST_MODE else "PRODUCTION (30 jours)",
         }), 200
     except Exception as e:
