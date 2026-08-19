@@ -9,7 +9,30 @@ import logging
 import sys
 
 app = Flask(__name__)
-DATA_DIR = "school_data"
+
+# ====================================================================
+# ⚡⚡⚡ NOUVEAU — STOCKAGE SUR DISQUE PERSISTANT RENDER
+# ====================================================================
+# Vous avez ajouté un disque persistant Render (1 Go) monté sur le
+# chemin /var/data. Tant que ce disque est attaché au service, tout ce
+# qui est écrit dans ce dossier survit aux redéploiements, redémarrages
+# et mises à jour du serveur — contrairement au disque local du
+# conteneur (éphémère), qui est effacé à chaque déploiement.
+#
+# DATA_DIR pointe maintenant vers un sous-dossier "school_data" DANS
+# le disque persistant (/var/data/school_data), pour garder toutes vos
+# données bien organisées à l'intérieur du point de montage.
+#
+# Vous pouvez surcharger ce chemin via la variable d'environnement
+# DATA_DIR si besoin (utile pour tester en local sans le disque Render
+# monté), sinon la valeur par défaut est bien /var/data/school_data.
+#
+# ⚠️ IMPORTANT côté Render : le "Mount Path" du disque doit être
+# /var/data (exactement ce que vous avez indiqué), et ce disque doit
+# être attaché à CE service précis. Rien d'autre à faire côté code :
+# os.makedirs(DATA_DIR, exist_ok=True) ci-dessous crée automatiquement
+# le sous-dossier school_data au premier démarrage si besoin.
+DATA_DIR = os.environ.get("DATA_DIR", "/var/data/school_data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 KEYS_FILE                  = os.path.join(DATA_DIR, "keys_store.json")
@@ -109,9 +132,10 @@ def _log_startup_state():
         if not school_files:
             logger.warning(
                 "⚠️ Aucun fichier école trouvé au démarrage. Si vous aviez "
-                "déjà des écoles sauvegardées avant ce redémarrage, cela "
-                "confirme que le stockage local n'est PAS persistant "
-                "(disque éphémère) et que les données ont été perdues."
+                "déjà des écoles sauvegardées avant ce redémarrage, vérifiez "
+                "que le disque persistant Render est bien attaché à ce "
+                "service et monté sur '/var/data' — sinon les données "
+                "peuvent avoir été perdues (stockage éphémère)."
             )
     except Exception as e:
         logger.error("Erreur lors du log de démarrage : %s", e)
