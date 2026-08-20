@@ -194,15 +194,154 @@ def mobile_money_available():
 # ⚡⚡⚡ NOUVEAU — HELPERS ABONNEMENT / CLÉ DE RECONNEXION
 # ====================================================================
 
-def _find_school_entry(school_code):
+def _find_in_schools_dict(schools, school_code):
+    """Recherche insensible à la casse d'une école dans un dict déjà
+    chargé (évite de relire le fichier plusieurs fois quand on a déjà
+    les données en mémoire)."""
     if not school_code:
         return None, None
-    schools = _load_json(SCHOOLS_FILE, {})
     target = school_code.strip().upper()
     for code, school in schools.items():
         if code.upper() == target:
             return code, school
     return None, None
+
+
+def _find_school_entry(school_code):
+    if not school_code:
+        return None, None
+    schools = _load_json(SCHOOLS_FILE, {})
+    return _find_in_schools_dict(schools, school_code)
+
+
+# ====================================================================
+# ⚡⚡⚡ NOUVEAU — RÉPARATION DES ÉCOLES "ORPHELINES"
+# ====================================================================
+# PROBLÈME CORRIGÉ ICI :
+# Une école possède DEUX choses séparées sur le disque :
+#   1) son entrée dans schools_registry.json (nom, ville, directeur,
+#      abonnement...) — c'est SEULEMENT ce fichier que lit
+#      /admin/list_schools, donc ce que voit le panneau admin.
+#   2) son fichier de données réel {code_ecole}.json (élèves, paiements,
+#      config...) — écrit par /school/activate puis mis à jour par
+#      /backup à chaque sauvegarde depuis l'app de l'école.
+#
+# Si le serveur redémarre AVANT l'achat du disque persistant (stockage
+# éphémère), schools_registry.json peut être perdu alors que l'école,
+# elle, continue d'utiliser l'application normalement et d'envoyer des
+# /backup. Ces /backup recréent bien {code_ecole}.json sur le disque
+# (les données de l'école existent donc réellement), mais PERSONNE ne
+# recrée l'entrée correspondante dans schools_registry.json. Résultat :
+# la liste des écoles (/admin/list_schools) ne montre jamais cette
+# école, même après avoir payé le disque persistant, puisqu'elle ne
+# regarde que le registre — jamais les fichiers de données eux-mêmes.
+#
+# _register_orphan_school_file() régénère l'entrée manquante du
+# registre à partir du fichier de données réel de l'école, dès qu'on la
+# détecte (à chaque /backup, et par un balayage complet au démarrage du
+# serveur ainsi qu'à chaque appel de /admin/list_schools).
+# ====================================================================
+
+def _register_orphan_school_file(school_code, fpath=None):
+    """Si 'school_code' n'a pas d'entrée dans schools_registry.json,
+    la recrée à partir de son fichier de données réel sur le disque.
+    Renvoie True si une entrée a été (re)créée, False sinon."""
+    if not school_code:
+        return False
+
+    schools = _load_json(SCHOOLS_FILE, {})
+    _, existing = _find_in_schools_dict(schools, school_code)
+    if existing is not None:
+        return False
+
+    if fpath is None:
+        fpath = os.path.join(DATA_DIR, f"{school_code.lower()}.json")
+    if not os.path.exists(fpath):
+        return False
+
+    try:
+        with open(fpath, 'r', encoding='utf-8') as f:
+            school_data = json.load(f)
+    except Exception as e:
+        logger.error(
+            "_register_orphan_school_file : fichier illisible '%s' : %s",
+            fpath, e,
+        )
+        return False
+
+    config = school_data.get('config', {})
+    reg_id = _generate_registration_id()
+    all_reg_ids = {s.get('registration_id') for s in schools.values()}
+    while reg_id in all_reg_ids:
+        reg_id = _generate_registration_id()
+
+    try:
+        mtime = datetime.datetime.fromtimestamp(
+            os.path.getmtime(fpath)).isoformat()
+    except Exception:
+        mtime = datetime.datetime.now().isoformat()
+
+    code_upper = school_code.strip().upper()
+    schools[code_upper] = {
+        "school_code":     code_upper,
+        "school_name":     config.get('schoolName', code_upper),
+        "city":            config.get('city', ''),
+        "address":         '',
+        "director":        config.get('director', ''),
+        "phone":           config.get('phone', ''),
+        "email":           config.get('email', ''),
+        "bank_name":       config.get('bankName', ''),
+        "bank_account":    config.get('bankAccount', ''),
+        "bank_branch":     config.get('bankBranch', ''),
+        "registration_id": reg_id,
+        "activated":       True,
+        "registered_at":   mtime,
+        "activated_at":    mtime,
+        # ⚡ On ne connaît pas la vraie date de fin d'abonnement de cette
+        # école récupérée : on la traite comme illimitée par défaut
+        # (elle ne sera jamais bloquée toute seule). Générez-lui une
+        # clé de reconnexion normalement si vous voulez lui fixer une
+        # nouvelle période d'abonnement de 30 jours.
+        "subscription_started_at": None,
+        "subscription_expires_at": None,
+        "subscription_blocked":    False,
+        # Marqueur informatif : cette entrée a été reconstituée
+        # automatiquement à partir du fichier de données, pas via le
+        # parcours normal d'enregistrement + activation.
+        "recovered":       True,
+    }
+    _save_json(SCHOOLS_FILE, schools)
+    logger.warning(
+        "🩹 École orpheline réenregistrée automatiquement dans le "
+        "registre : code='%s' nom='%s' (source='%s')",
+        code_upper, schools[code_upper]['school_name'], fpath,
+    )
+    return True
+
+
+def _sync_orphan_schools():
+    """Balaye tous les fichiers école présents sur le disque et
+    réenregistre dans schools_registry.json tous ceux qui n'y figurent
+    pas encore. Appelé au démarrage du serveur (pour réparer d'un coup
+    toutes les écoles perdues avant l'achat du disque persistant) ainsi
+    qu'à chaque consultation de la liste des écoles, par sécurité."""
+    try:
+        nb_reparees = 0
+        for fname in os.listdir(DATA_DIR):
+            if not fname.endswith('.json') or fname in SYSTEM_FILES:
+                continue
+            school_code = fname[:-5]  # retire l'extension '.json'
+            fpath = os.path.join(DATA_DIR, fname)
+            if _register_orphan_school_file(school_code, fpath):
+                nb_reparees += 1
+        if nb_reparees:
+            logger.info(
+                "🩹 _sync_orphan_schools : %d école(s) orpheline(s) "
+                "réparée(s) et réintégrée(s) au registre.",
+                nb_reparees,
+            )
+    except Exception:
+        logger.exception("Erreur _sync_orphan_schools")
 
 
 def _generate_reconnection_key_str():
@@ -559,6 +698,16 @@ def list_schools():
         data = request.get_json()
         if data.get('admin_password') != ADMIN_PASSWORD:
             return jsonify({"error": "Accès refusé"}), 401
+
+        # ⚡⚡⚡ CORRECTION DU BUG — avant de construire la liste, on
+        # répare d'abord le registre en y réintégrant toute école dont
+        # le fichier de données existe sur le disque mais qui n'a plus
+        # d'entrée dans schools_registry.json (ex: école créée avant
+        # l'achat du disque persistant, dont le registre a été perdu à
+        # un redémarrage, mais dont les sauvegardes /backup ont
+        # continué d'arriver).
+        _sync_orphan_schools()
+
         schools = _load_json(SCHOOLS_FILE, {})
         summary = [{
             "school_code":   sc,
@@ -569,6 +718,7 @@ def list_schools():
             "registered_at": s.get('registered_at'),
             "activated_at":  s.get('activated_at'),
             "subscription":  _compute_subscription_status(s),
+            "recovered":     s.get('recovered', False),
         } for sc, s in schools.items()]
         logger.info("list_schools : %d école(s) enregistrée(s)", len(summary))
         return jsonify({"schools": summary, "total": len(summary)}), 200
@@ -613,6 +763,20 @@ def backup():
             "| %d correction(s) d'ID",
             school_code, filepath, file_size, len(corrections),
         )
+
+        # ⚡⚡⚡ CORRECTION DU BUG — si cette école n'a pas (ou plus)
+        # d'entrée dans schools_registry.json (registre perdu à un
+        # ancien redémarrage avant le disque persistant, par exemple),
+        # on la réenregistre immédiatement à partir de ses propres
+        # données qu'on vient d'écrire. Elle redevient ainsi visible
+        # dans /admin/list_schools dès ce backup, sans attendre un
+        # redémarrage du serveur.
+        if _register_orphan_school_file(school_code, filepath):
+            logger.info(
+                "🩹 backup : école='%s' réintégrée au registre au moment "
+                "de la sauvegarde (elle n'y était plus).",
+                school_code,
+            )
 
         _, school_entry = _find_school_entry(school_code)
         return jsonify({
@@ -2453,6 +2617,17 @@ def admin_health():
     except Exception as e:
         logger.exception("Erreur admin_health")
         return jsonify({"error": str(e)}), 500
+
+
+# ====================================================================
+# ⚡⚡⚡ NOUVEAU — RÉPARATION AUTOMATIQUE AU DÉMARRAGE DU SERVEUR
+# ====================================================================
+# S'exécute une fois, au chargement du module (donc aussi bien avec
+# `python3 school_server.py` qu'avec gunicorn sur Render). Répare
+# immédiatement toutes les écoles orphelines déjà présentes sur le
+# disque persistant, sans attendre le prochain /backup ou la prochaine
+# consultation de /admin/list_schools.
+_sync_orphan_schools()
 
 
 if __name__ == '__main__':
