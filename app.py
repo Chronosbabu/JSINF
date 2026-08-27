@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 import json
 import os
 import re
@@ -446,6 +446,24 @@ def _distribute_payment(config, eleve, start_mois, total_amount):
 
 
 # ====================================================================
+# ⚡⚡⚡ NOUVEAU — CORS (pour permettre à la version web parent.html,
+# éventuellement hébergée sur un domaine différent — GitHub Pages ou
+# autre — d'appeler ce serveur depuis le navigateur). N'affecte AUCUNE
+# route existante : on se contente d'ajouter des en-têtes sur chaque
+# réponse, sans rien changer au routage ni à la logique métier. L'app
+# Flutter (mobile/desktop) n'est pas concernée par CORS et continue de
+# fonctionner exactement comme avant.
+# ====================================================================
+@app.after_request
+def _add_cors_headers(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+    response.headers['Access-Control-Max-Age'] = '86400'
+    return response
+
+
+# ====================================================================
 # ⚡ LOG DE CHAQUE REQUÊTE ENTRANTE
 # ====================================================================
 @app.before_request
@@ -454,6 +472,30 @@ def _log_incoming_request():
         "→ %s %s | IP=%s",
         request.method, request.path, request.remote_addr,
     )
+
+
+# ====================================================================
+# ⚡⚡⚡ NOUVEAU — VERSION WEB PARENT (parent.html)
+# ====================================================================
+# Sert le fichier statique 'parent.html' placé à côté de ce script dans
+# le dépôt, pour que les parents puissent enregistrer l'ID de leur
+# enfant et suivre paiements + discipline directement depuis un
+# navigateur, sans installer l'app Flutter. Le fichier appelle les
+# MÊMES routes /parent/... déjà utilisées par l'app mobile, donc aucune
+# route existante n'est modifiée ; on ajoute seulement deux façons
+# d'accéder à ce fichier statique.
+# ====================================================================
+_WEB_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+@app.route('/parent.html', methods=['GET'])
+def serve_parent_html():
+    return send_from_directory(_WEB_DIR, 'parent.html')
+
+
+@app.route('/parent', methods=['GET'])
+def serve_parent_html_alias():
+    return send_from_directory(_WEB_DIR, 'parent.html')
 
 
 # ====================================================================

@@ -1,0 +1,984 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1">
+<title>Suivi Scolaire — Espace Parent</title>
+<style>
+  :root{
+    --green:#2e7d32;
+    --green-dark:#1b5e20;
+    --green-light:#e8f5e9;
+    --orange:#ef6c00;
+    --red:#c62828;
+    --indigo:#3949ab;
+    --blue:#1565c0;
+    --grey:#757575;
+    --grey-light:#f5f5f5;
+    --border:#e0e0e0;
+    --card-radius:14px;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;height:100%;}
+  body{
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    background:#fafafa;
+    color:#1a1a1a;
+    -webkit-tap-highlight-color:transparent;
+  }
+  #app{max-width:640px;margin:0 auto;min-height:100vh;background:#fafafa;display:flex;flex-direction:column;}
+
+  /* ---------- App bar ---------- */
+  .appbar{
+    background:var(--green);
+    color:#fff;
+    padding:14px 16px;
+    display:flex;
+    align-items:center;
+    gap:10px;
+    position:sticky;top:0;z-index:20;
+    box-shadow:0 2px 6px rgba(0,0,0,.12);
+  }
+  .appbar h1{font-size:18px;margin:0;font-weight:600;flex:1;text-align:center;}
+  .appbar .icon-btn{
+    background:none;border:none;color:#fff;font-size:20px;cursor:pointer;
+    width:36px;height:36px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+    flex-shrink:0;
+  }
+  .appbar .icon-btn:active{background:rgba(255,255,255,.2);}
+  .appbar .spacer{width:36px;}
+
+  .tabbar{display:flex;background:var(--green-dark);}
+  .tabbar button{
+    flex:1;background:none;border:none;color:rgba(255,255,255,.75);
+    padding:10px 4px;font-size:12px;display:flex;flex-direction:column;align-items:center;gap:3px;
+    cursor:pointer;border-bottom:3px solid transparent;
+  }
+  .tabbar button.active{color:#fff;border-bottom-color:#fff;font-weight:600;}
+  .tabbar button .ic{font-size:18px;}
+
+  /* ---------- Views ---------- */
+  .view{display:none;flex:1;flex-direction:column;}
+  .view.active{display:flex;}
+
+  /* ---------- Home ---------- */
+  #homeList{padding:16px;flex:1;}
+  .child-card{
+    background:#fff;border-radius:var(--card-radius);box-shadow:0 1px 4px rgba(0,0,0,.08);
+    padding:10px 12px;margin-bottom:12px;display:flex;align-items:center;gap:14px;cursor:pointer;
+  }
+  .avatar{
+    width:48px;height:48px;border-radius:50%;background:var(--green);color:#fff;
+    display:flex;align-items:center;justify-content:center;font-weight:700;font-size:18px;flex-shrink:0;
+  }
+  .child-card .info{flex:1;min-width:0;}
+  .child-card .info .name{font-weight:700;font-size:15px;margin-bottom:2px;}
+  .child-card .info .sub{font-size:12px;color:var(--grey);line-height:1.4;}
+  .child-card .del{background:none;border:none;color:var(--red);font-size:20px;cursor:pointer;padding:6px;flex-shrink:0;}
+
+  .empty-state{text-align:center;padding:60px 24px;color:var(--grey);}
+  .empty-state .big-ic{font-size:70px;opacity:.4;margin-bottom:14px;}
+  .empty-state h3{color:#616161;font-size:19px;margin:0 0 8px;}
+
+  .fab{
+    position:fixed;bottom:22px;left:50%;transform:translateX(calc(-50% - 0px));
+    max-width:640px;width:calc(100% - 32px);
+    display:flex;justify-content:flex-end;pointer-events:none;
+  }
+  .fab button{
+    pointer-events:auto;
+    background:var(--green);color:#fff;border:none;border-radius:28px;
+    padding:14px 22px;font-size:14px;font-weight:600;display:flex;align-items:center;gap:8px;
+    box-shadow:0 4px 10px rgba(0,0,0,.25);cursor:pointer;
+  }
+
+  /* ---------- Detail: profil ---------- */
+  .scroll-pad{padding:20px;overflow-y:auto;flex:1;}
+  .profile-avatar{width:100px;height:100px;border-radius:50%;background:var(--green);color:#fff;
+    display:flex;align-items:center;justify-content:center;font-size:36px;font-weight:700;margin:0 auto 20px;}
+  .profile-name{text-align:center;font-size:22px;font-weight:700;margin-bottom:6px;}
+  .profile-sub{text-align:center;color:var(--grey);margin-bottom:26px;font-size:15px;}
+  .info-card{background:#fff;border-radius:10px;box-shadow:0 1px 3px rgba(0,0,0,.08);padding:12px 16px;margin-bottom:12px;}
+  .info-card .lbl{font-size:12px;color:var(--grey);}
+  .info-card .val{font-size:16px;font-weight:500;margin-top:2px;}
+
+  /* ---------- Paiements ---------- */
+  .summary-bar{background:rgba(46,125,50,.09);padding:16px;display:flex;justify-content:space-evenly;}
+  .summary-chip{text-align:center;}
+  .summary-chip .lbl{font-size:11px;font-weight:500;}
+  .summary-chip .val{font-weight:700;font-size:13px;margin-top:2px;}
+
+  .month-list{padding:12px;overflow-y:auto;flex:1;}
+  .month-card{
+    background:#fff;border-radius:10px;box-shadow:0 1px 3px rgba(0,0,0,.08);
+    padding:10px 14px;margin-bottom:8px;display:flex;align-items:center;gap:12px;cursor:pointer;
+  }
+  .month-circle{width:38px;height:38px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+    flex-shrink:0;font-size:17px;}
+  .month-circle.paid{background:var(--green);color:#fff;}
+  .month-circle.pending{background:#ffe0b2;color:var(--orange);}
+  .month-card .m-info{flex:1;min-width:0;}
+  .month-card .m-info .mois{font-weight:700;font-size:14px;}
+  .month-card .m-info .detail{font-size:12.5px;color:#444;margin-top:2px;}
+  .month-card .arrow{color:#bbb;font-size:13px;}
+
+  .refresh-row{padding:10px 12px 0;}
+  .refresh-row button{width:100%;padding:10px;border-radius:8px;border:1px solid var(--border);background:#fff;
+    color:var(--green);font-weight:600;cursor:pointer;}
+
+  /* ---------- Discipline ---------- */
+  .msg-list{padding:12px;overflow-y:auto;flex:1;}
+  .msg-card{background:#fff;border-radius:10px;box-shadow:0 1px 3px rgba(0,0,0,.08);
+    padding:12px 14px;margin-bottom:10px;display:flex;gap:12px;cursor:pointer;}
+  .msg-card.unread{background:var(--green-light);}
+  .msg-ic{width:40px;height:40px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+    color:#fff;font-size:18px;flex-shrink:0;}
+  .msg-body{flex:1;min-width:0;}
+  .msg-body .title{font-size:14.5px;}
+  .msg-body .title.b{font-weight:700;}
+  .msg-body .txt{font-size:13px;color:#333;margin-top:3px;
+    display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;}
+  .msg-body .date{font-size:11.5px;color:var(--grey);margin-top:4px;}
+  .msg-dot{width:12px;height:12px;border-radius:50%;background:var(--green);flex-shrink:0;margin-top:4px;}
+
+  /* ---------- Loading / error ---------- */
+  .center-box{flex:1;display:flex;align-items:center;justify-content:center;padding:30px;}
+  .spinner{width:38px;height:38px;border:4px solid #dcdcdc;border-top-color:var(--green);border-radius:50%;
+    animation:spin .8s linear infinite;}
+  @keyframes spin{to{transform:rotate(360deg);}}
+  .err-box{text-align:center;}
+  .err-box .ic{font-size:56px;color:var(--red);margin-bottom:10px;}
+  .btn{
+    background:var(--green);color:#fff;border:none;border-radius:8px;padding:10px 18px;
+    font-size:14px;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:6px;
+  }
+  .btn.outline{background:#fff;color:var(--green);border:1px solid var(--green);}
+  .btn.red{background:var(--red);}
+  .btn:disabled{opacity:.5;cursor:default;}
+
+  /* ---------- Modal ---------- */
+  .modal-backdrop{
+    position:fixed;inset:0;background:rgba(0,0,0,.5);display:none;align-items:center;justify-content:center;
+    z-index:100;padding:16px;
+  }
+  .modal-backdrop.active{display:flex;}
+  .modal{background:#fff;border-radius:16px;max-width:440px;width:100%;max-height:88vh;overflow-y:auto;
+    padding:22px 20px;}
+  .modal h2{font-size:17px;margin:0 0 14px;font-weight:700;}
+  .modal .hint{font-size:12px;color:var(--grey);margin-bottom:14px;}
+  .field{width:100%;padding:11px 12px;border:1px solid var(--border);border-radius:8px;font-size:15px;margin-bottom:10px;}
+  .field:focus{outline:none;border-color:var(--green);}
+  .modal-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:18px;}
+
+  .found-card{background:var(--green-light);border:1px solid #c8e6c9;border-radius:8px;padding:12px;margin-top:6px;}
+  .found-card .ok{color:var(--green);font-weight:700;font-size:13px;margin-bottom:6px;}
+  .found-card .nm{font-weight:700;font-size:15px;}
+  .found-card .cl{font-size:13px;margin-top:2px;}
+  .found-card .sc{font-size:12px;color:var(--grey);margin-top:2px;}
+  .err-note{background:#ffebee;border:1px solid #ffcdd2;color:var(--red);border-radius:8px;padding:10px;font-size:13px;margin-top:6px;white-space:pre-line;}
+
+  .row-between{display:flex;justify-content:space-evenly;text-align:center;}
+  .divider{height:1px;background:var(--border);margin:16px 0;}
+
+  .tx-item{display:flex;align-items:center;gap:8px;padding:6px 0;font-size:13px;border-bottom:1px solid #f0f0f0;}
+  .tx-item .tx-ic{font-size:16px;flex-shrink:0;}
+  .tx-item .tx-mid{flex:1;}
+  .tx-item .tx-sub{font-size:11px;color:var(--green);}
+  .tx-item .tx-amt{font-weight:700;}
+
+  .dist-box{background:#e3f2fd;border:1px solid #bbdefb;border-radius:8px;padding:10px;margin-bottom:14px;}
+  .dist-box .ttl{font-weight:700;font-size:12px;color:var(--blue);margin-bottom:6px;}
+  .dist-row{display:flex;justify-content:space-between;font-size:12px;margin-bottom:3px;}
+  .dist-total{display:flex;justify-content:space-between;font-weight:700;font-size:12px;color:var(--blue);
+    border-top:1px solid #bbdefb;padding-top:6px;margin-top:6px;}
+  .dist-note{color:var(--green);font-weight:700;font-size:11px;margin-top:4px;}
+
+  .net-tiles{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:8px;}
+  .net-tile{padding:8px 14px;border-radius:20px;border:1px solid var(--border);background:var(--grey-light);
+    font-size:13px;cursor:pointer;color:#333;}
+  .net-tile.sel{background:var(--green);color:#fff;border-color:var(--green-dark);font-weight:600;}
+
+  .info-note{background:#e3f2fd;border:1px solid #bbdefb;border-radius:8px;padding:10px;font-size:11.5px;color:#37474f;margin-top:10px;}
+
+  .success-head{display:flex;align-items:center;gap:8px;margin-bottom:14px;}
+  .success-head .ic{color:var(--green);font-size:22px;}
+  .success-line{font-size:13px;margin-bottom:6px;}
+  .footnote{font-size:12px;color:var(--grey);margin-top:10px;}
+
+  .toast{
+    position:fixed;bottom:24px;left:50%;transform:translateX(-50%);
+    background:#323232;color:#fff;padding:12px 18px;border-radius:8px;font-size:13.5px;
+    box-shadow:0 3px 10px rgba(0,0,0,.3);z-index:200;max-width:90%;text-align:center;
+    opacity:0;transition:opacity .25s;pointer-events:none;
+  }
+  .toast.show{opacity:1;}
+  .toast.orange{background:var(--orange);}
+  .toast.green{background:var(--green);}
+
+  a{color:inherit;}
+</style>
+</head>
+<body>
+<div id="app">
+
+  <!-- ============ HOME VIEW ============ -->
+  <div class="view active" id="view-home">
+    <div class="appbar">
+      <div class="spacer"></div>
+      <h1>Suivi Scolaire</h1>
+      <div class="spacer"></div>
+    </div>
+    <div id="homeList"></div>
+    <div class="fab"><button id="btnAddChild">➕ Ajouter un enfant</button></div>
+  </div>
+
+  <!-- ============ DETAIL VIEW ============ -->
+  <div class="view" id="view-detail">
+    <div class="appbar">
+      <button class="icon-btn" id="btnBack">←</button>
+      <h1 id="detailTitle">Élève</h1>
+      <div class="spacer"></div>
+    </div>
+    <div class="tabbar">
+      <button class="tab-btn active" data-tab="profil"><span class="ic">👤</span>Profil</button>
+      <button class="tab-btn" data-tab="paiements"><span class="ic">💳</span>Paiements</button>
+      <button class="tab-btn" data-tab="discipline"><span class="ic">🔔</span>Discipline</button>
+    </div>
+
+    <!-- Profil -->
+    <div class="view active" id="tab-profil" style="flex:1;">
+      <div class="scroll-pad" id="profilContent"></div>
+    </div>
+
+    <!-- Paiements -->
+    <div class="view" id="tab-paiements" style="flex:1;">
+      <div id="paiementsContent" style="display:flex;flex-direction:column;flex:1;"></div>
+    </div>
+
+    <!-- Discipline -->
+    <div class="view" id="tab-discipline" style="flex:1;">
+      <div id="disciplineContent" style="display:flex;flex-direction:column;flex:1;"></div>
+    </div>
+  </div>
+
+</div>
+
+<!-- ============ MODAL: Ajouter enfant ============ -->
+<div class="modal-backdrop" id="modalAdd">
+  <div class="modal">
+    <h2>Ajouter votre enfant</h2>
+    <p class="hint">Entrez l'identifiant (ID) de votre enfant, fourni par l'école lors de l'inscription.</p>
+    <input class="field" id="inputChildId" placeholder="Ex: BA26M1" autocapitalize="characters">
+    <div id="addResultZone"></div>
+    <div class="modal-actions">
+      <button class="btn outline" id="btnCancelAdd">Annuler</button>
+      <button class="btn" id="btnSearchChild">🔍 Rechercher</button>
+      <button class="btn" id="btnConfirmChild" style="display:none;">✔ Confirmer</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============ MODAL: Supprimer enfant ============ -->
+<div class="modal-backdrop" id="modalDelete">
+  <div class="modal">
+    <h2>Supprimer</h2>
+    <p id="deleteMsg"></p>
+    <div class="modal-actions">
+      <button class="btn outline" id="btnCancelDelete">Annuler</button>
+      <button class="btn red" id="btnConfirmDelete">Supprimer</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============ MODAL: Détail du mois ============ -->
+<div class="modal-backdrop" id="modalMonth">
+  <div class="modal">
+    <h2 id="monthModalTitle">Mois</h2>
+    <div class="row-between" id="monthSummaryRow"></div>
+    <div class="divider"></div>
+    <div style="font-weight:700;font-size:13px;margin-bottom:6px;">Historique des paiements :</div>
+    <div id="monthTxList" style="max-height:180px;overflow-y:auto;"></div>
+    <div class="modal-actions">
+      <button class="btn outline" id="btnCloseMonth">Fermer</button>
+      <button class="btn" id="btnGoPay" style="display:none;">📱 Payer</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============ MODAL: Paiement ============ -->
+<div class="modal-backdrop" id="modalPay">
+  <div class="modal">
+    <h2 id="payModalTitle">Payer</h2>
+    <p id="payDueLine" style="font-weight:700;font-size:14px;"></p>
+    <input class="field" id="inputAmount" type="number" placeholder="Montant à payer (FC)">
+    <p class="hint" style="margin-top:-6px;">Vous pouvez payer plus d'un mois à la fois</p>
+    <div id="distZone"></div>
+    <div style="font-weight:700;margin-bottom:8px;">Choisissez votre réseau :</div>
+    <div class="net-tiles" id="netTiles">
+      <div class="net-tile" data-net="airtel">Airtel Money</div>
+      <div class="net-tile" data-net="orange">Orange Money</div>
+      <div class="net-tile" data-net="vodacom">M-Pesa (Vodacom)</div>
+      <div class="net-tile" data-net="mpesa">M-Pesa</div>
+    </div>
+    <div id="netInfoNote"></div>
+    <div class="modal-actions">
+      <button class="btn outline" id="btnCancelPay">Annuler</button>
+      <button class="btn" id="btnSubmitPay" disabled>Envoyer la demande</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============ MODAL: Succès ============ -->
+<div class="modal-backdrop" id="modalSuccess">
+  <div class="modal">
+    <div class="success-head"><span class="ic">✅</span><h2 style="margin:0;">Demande envoyée</h2></div>
+    <div id="successBody"></div>
+    <div class="modal-actions">
+      <button class="btn" id="btnSuccessOk">Compris</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+(function(){
+"use strict";
+
+// ==================================================================
+// CONFIG
+// ==================================================================
+var API_BASE = "https://jsinf.onrender.com";
+var STORAGE_KEY = "edupay_parent_children";
+var MONTHS = ["Septembre","Octobre","Novembre","Decembre","Janvier","Fevrier","Mars","Avril","Mai","Juin"];
+
+// ==================================================================
+// STATE
+// ==================================================================
+var children = [];          // liste des enfants suivis (persistée en localStorage)
+var currentChild = null;    // enfant actuellement ouvert dans la vue détail
+var paymentData = null;     // données paiements de l'enfant courant
+var messages = [];          // messages discipline de l'enfant courant
+var pendingDeleteIndex = null;
+var monthModalCtx = null;   // { mois, payed, required, isFullyPaid }
+var payModalCtx = null;     // { startMois, amountDue }
+var selectedNetwork = null;
+
+// ==================================================================
+// HELPERS GÉNÉRAUX
+// ==================================================================
+function $(id){ return document.getElementById(id); }
+function esc(s){
+  return String(s == null ? "" : s).replace(/[&<>"']/g, function(c){
+    return {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c];
+  });
+}
+function fmt(n){
+  n = Number(n) || 0;
+  return n.toLocaleString("fr-FR", {maximumFractionDigits:0});
+}
+function showToast(msg, kind){
+  var t = $("toast");
+  t.textContent = msg;
+  t.className = "toast show" + (kind ? " " + kind : "");
+  clearTimeout(t._timer);
+  t._timer = setTimeout(function(){ t.classList.remove("show"); }, 3200);
+}
+function openModal(id){ $(id).classList.add("active"); }
+function closeModal(id){ $(id).classList.remove("active"); }
+
+async function apiGet(path){
+  try{
+    var res = await fetch(API_BASE + path, {method:"GET"});
+    var data = null;
+    try{ data = await res.json(); }catch(e){ data = null; }
+    if(res.ok){ return {success:true, data:data}; }
+    return {success:false, error:(data && (data.error||data.message)) || "Impossible de charger les données. Réessayez."};
+  }catch(e){
+    return {success:false, error:"Connexion impossible. Vérifiez votre internet."};
+  }
+}
+async function apiPost(path, body){
+  try{
+    var res = await fetch(API_BASE + path, {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify(body)
+    });
+    var data = null;
+    try{ data = await res.json(); }catch(e){ data = null; }
+    if(res.ok){ return {success:true, data:data}; }
+    return {success:false, error:(data && (data.error||data.message)) || "Impossible d'envoyer. Réessayez."};
+  }catch(e){
+    return {success:false, error:"Connexion impossible. Vérifiez votre internet."};
+  }
+}
+
+// ==================================================================
+// PERSISTENCE LOCALE (équivalent SharedPreferences)
+// ==================================================================
+function loadChildren(){
+  try{
+    var raw = localStorage.getItem(STORAGE_KEY);
+    children = raw ? JSON.parse(raw) : [];
+  }catch(e){ children = []; }
+  renderHome();
+}
+function saveChildren(){
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(children));
+}
+
+// ==================================================================
+// VUE HOME
+// ==================================================================
+function initials(nom){
+  return nom && nom.length ? nom[0].toUpperCase() : "?";
+}
+function nomComplet(c){
+  return [c.nom, c.postNom, c.prenom].filter(Boolean).join(" ").trim();
+}
+
+function renderHome(){
+  var list = $("homeList");
+  if(!children.length){
+    list.innerHTML =
+      '<div class="empty-state">'+
+        '<div class="big-ic">🧒</div>'+
+        '<h3>Aucun enfant ajouté</h3>'+
+        '<div>Appuyez sur le bouton + ci-dessous<br>et entrez l\'ID fourni par l\'école.</div>'+
+      '</div>';
+    return;
+  }
+  var html = "";
+  children.forEach(function(c, i){
+    html += '<div class="child-card" data-index="'+i+'">'+
+      '<div class="avatar">'+esc(initials(c.nom))+'</div>'+
+      '<div class="info">'+
+        '<div class="name">'+esc(nomComplet(c))+'</div>'+
+        '<div class="sub">'+esc(c.classe)+' • '+esc(c.section)+'<br>'+esc(c.schoolName)+'</div>'+
+      '</div>'+
+      '<button class="del" data-del="'+i+'">🗑</button>'+
+    '</div>';
+  });
+  list.innerHTML = html;
+
+  Array.prototype.forEach.call(list.querySelectorAll(".child-card"), function(card){
+    card.addEventListener("click", function(e){
+      if(e.target.closest("[data-del]")) return;
+      var idx = Number(card.getAttribute("data-index"));
+      openChildDetail(children[idx]);
+    });
+  });
+  Array.prototype.forEach.call(list.querySelectorAll("[data-del]"), function(btn){
+    btn.addEventListener("click", function(e){
+      e.stopPropagation();
+      pendingDeleteIndex = Number(btn.getAttribute("data-del"));
+      $("deleteMsg").textContent = "Supprimer " + children[pendingDeleteIndex].nom + " de votre liste de suivi ?";
+      openModal("modalDelete");
+    });
+  });
+}
+
+$("btnConfirmDelete").addEventListener("click", function(){
+  if(pendingDeleteIndex != null){
+    children.splice(pendingDeleteIndex, 1);
+    saveChildren();
+    renderHome();
+  }
+  pendingDeleteIndex = null;
+  closeModal("modalDelete");
+});
+$("btnCancelDelete").addEventListener("click", function(){ closeModal("modalDelete"); });
+
+// ==================================================================
+// MODAL : AJOUTER ENFANT
+// ==================================================================
+var foundChild = null;
+
+function resetAddModal(){
+  foundChild = null;
+  $("inputChildId").value = "";
+  $("addResultZone").innerHTML = "";
+  $("btnSearchChild").style.display = "inline-flex";
+  $("btnConfirmChild").style.display = "none";
+  $("btnSearchChild").disabled = false;
+}
+
+$("btnAddChild").addEventListener("click", function(){
+  resetAddModal();
+  openModal("modalAdd");
+});
+$("btnCancelAdd").addEventListener("click", function(){ closeModal("modalAdd"); });
+
+$("btnSearchChild").addEventListener("click", async function(){
+  var id = $("inputChildId").value.trim().toUpperCase();
+  if(!id) return;
+  $("btnSearchChild").disabled = true;
+  $("addResultZone").innerHTML = '<div class="center-box" style="padding:16px;"><div class="spinner"></div></div>';
+
+  var res = await apiGet("/parent/find_student?student_id=" + encodeURIComponent(id));
+  $("btnSearchChild").disabled = false;
+
+  if(res.success && res.data && res.data.found){
+    var s = res.data.student || {};
+    foundChild = {
+      id: s.id || "", nom: s.nom || "", postNom: s.postNom || "", prenom: s.prenom || "",
+      classe: s.classe || "", section: s.section || "",
+      schoolCode: res.data.school_code || "", schoolName: res.data.school_name || "",
+      currentYear: res.data.current_year || "", config: res.data.config || {}
+    };
+    $("addResultZone").innerHTML =
+      '<div class="found-card">'+
+        '<div class="ok">✅ Élève trouvé :</div>'+
+        '<div class="nm">'+esc(nomComplet(foundChild))+'</div>'+
+        '<div class="cl">'+esc(foundChild.classe)+' • '+esc(foundChild.section)+'</div>'+
+        '<div class="sc">'+esc(foundChild.schoolName)+'</div>'+
+      '</div>';
+    $("btnSearchChild").style.display = "none";
+    $("btnConfirmChild").style.display = "inline-flex";
+  } else {
+    foundChild = null;
+    var errMsg = (res.data && res.data.error) || res.error || "Aucun élève trouvé avec cet ID.";
+    $("addResultZone").innerHTML = '<div class="err-note">'+esc(errMsg)+'</div>';
+  }
+});
+
+$("btnConfirmChild").addEventListener("click", function(){
+  if(!foundChild) return;
+  var already = children.some(function(c){ return c.id === foundChild.id; });
+  if(already){
+    showToast("Cet élève est déjà dans votre liste.");
+    closeModal("modalAdd");
+    return;
+  }
+  children.push(foundChild);
+  saveChildren();
+  renderHome();
+  showToast("✅ " + foundChild.nom + " ajouté avec succès", "green");
+  closeModal("modalAdd");
+});
+
+// ==================================================================
+// NAVIGATION HOME <-> DETAIL
+// ==================================================================
+$("btnBack").addEventListener("click", function(){
+  $("view-detail").classList.remove("active");
+  $("view-home").classList.add("active");
+  currentChild = null;
+});
+
+Array.prototype.forEach.call(document.querySelectorAll(".tab-btn"), function(btn){
+  btn.addEventListener("click", function(){
+    Array.prototype.forEach.call(document.querySelectorAll(".tab-btn"), function(b){ b.classList.remove("active"); });
+    btn.classList.add("active");
+    ["profil","paiements","discipline"].forEach(function(t){
+      $("tab-" + t).classList.toggle("active", t === btn.getAttribute("data-tab"));
+    });
+  });
+});
+
+function openChildDetail(child){
+  currentChild = child;
+  $("detailTitle").textContent = nomComplet(child);
+  $("view-home").classList.remove("active");
+  $("view-detail").classList.add("active");
+
+  // reset vers l'onglet Profil par défaut
+  Array.prototype.forEach.call(document.querySelectorAll(".tab-btn"), function(b){ b.classList.remove("active"); });
+  document.querySelector('.tab-btn[data-tab="profil"]').classList.add("active");
+  ["profil","paiements","discipline"].forEach(function(t){ $("tab-" + t).classList.toggle("active", t === "profil"); });
+
+  renderProfil(child);
+  loadPayments(child);
+  loadMessages(child);
+}
+
+// ==================================================================
+// ONGLET PROFIL
+// ==================================================================
+function renderProfil(c){
+  $("profilContent").innerHTML =
+    '<div class="profile-avatar">'+esc(initials(c.nom))+'</div>'+
+    '<div class="profile-name">'+esc(nomComplet(c))+'</div>'+
+    '<div class="profile-sub">'+esc(c.classe)+' • '+esc(c.section)+'</div>'+
+    infoCard("ID Élève", c.id)+
+    infoCard("École", c.schoolName)+
+    infoCard("Code école", c.schoolCode)+
+    infoCard("Année scolaire", c.currentYear);
+}
+function infoCard(label, value){
+  return '<div class="info-card"><div class="lbl">'+esc(label)+'</div><div class="val">'+esc(value)+'</div></div>';
+}
+
+// ==================================================================
+// LOGIQUE PAIEMENTS (répartition multi-mois — identique à Flutter)
+// ==================================================================
+function getRequiredForMonth(mois){
+  var section = currentChild.section;
+  var config = currentChild.config || {};
+
+  var configExceptions = (config.monthlyExceptionsBySection || {})[section];
+  if(configExceptions && configExceptions[mois] != null) return Number(configExceptions[mois]);
+
+  var configFees = config.feesBySection || {};
+  if(configFees[section] != null) return Number(configFees[section]);
+
+  var serverExceptions = (paymentData.monthly_exceptions || {})[section];
+  if(serverExceptions && serverExceptions[mois] != null) return Number(serverExceptions[mois]);
+
+  var fee = (paymentData.fees_by_section || {})[section];
+  if(fee != null) return Number(fee);
+
+  return 35000;
+}
+function getPaidMap(){ return paymentData.paid || {}; }
+function getTransactions(){ return paymentData.transactions || []; }
+
+function distributeAmount(startMois, totalAmount){
+  var entries = [];
+  var index = MONTHS.indexOf(startMois);
+  if(index === -1) return entries;
+  var remaining = totalAmount;
+  var paidMap = getPaidMap();
+  while(remaining > 0 && index < MONTHS.length){
+    var currentMonth = MONTHS[index];
+    var required = getRequiredForMonth(currentMonth);
+    var alreadyPaid = Number(paidMap[currentMonth] || 0);
+    var needed = required - alreadyPaid;
+    if(needed > 0){
+      var toAdd = remaining > needed ? needed : remaining;
+      entries.push({mois: currentMonth, amount: toAdd});
+      remaining -= toAdd;
+    }
+    index++;
+  }
+  return entries;
+}
+function totalPaid(){
+  var paidMap = getPaidMap();
+  var sum = 0;
+  Object.keys(paidMap).forEach(function(k){ sum += Number(paidMap[k]) || 0; });
+  return sum;
+}
+function totalRequired(){
+  var sum = 0;
+  MONTHS.forEach(function(m){ sum += getRequiredForMonth(m); });
+  return sum;
+}
+
+// ==================================================================
+// ONGLET PAIEMENTS
+// ==================================================================
+async function loadPayments(child){
+  var el = $("paiementsContent");
+  el.innerHTML = '<div class="center-box"><div class="spinner"></div></div>';
+
+  var res = await apiGet("/parent/get_payment_history?student_id="+encodeURIComponent(child.id)+
+    "&school_code="+encodeURIComponent(child.schoolCode));
+
+  if(!res.success){
+    renderPaymentsError((res.data && res.data.error) || res.error);
+    return;
+  }
+  paymentData = res.data;
+  renderPaymentsTab();
+}
+
+function renderPaymentsError(msg){
+  var el = $("paiementsContent");
+  el.innerHTML =
+    '<div class="center-box"><div class="err-box">'+
+      '<div class="ic">⚠️</div>'+
+      '<div style="margin-bottom:16px;">'+esc(msg || "Impossible de charger les données. Réessayez.")+'</div>'+
+      '<button class="btn" id="btnRetryPayments">🔄 Réessayer</button>'+
+    '</div></div>';
+  $("btnRetryPayments").addEventListener("click", function(){ loadPayments(currentChild); });
+}
+
+function renderPaymentsTab(){
+  var el = $("paiementsContent");
+  var paid = totalPaid();
+  var required = totalRequired();
+  var reste = Math.max(0, required - paid);
+
+  var html = '<div class="refresh-row"><button id="btnRefreshPayments">🔄 Actualiser</button></div>';
+  html += '<div class="summary-bar">'+
+      summaryChip("Payé", paid, "var(--green)")+
+      summaryChip("Reste", reste, reste > 0 ? "var(--orange)" : "var(--green)")+
+      summaryChip("Requis annuel", required, "var(--indigo)")+
+    '</div>';
+  html += '<div class="month-list" id="monthList"></div>';
+  el.innerHTML = html;
+
+  $("btnRefreshPayments").addEventListener("click", function(){ loadPayments(currentChild); });
+
+  var listEl = $("monthList");
+  var paidMap = getPaidMap();
+  var tx = getTransactions();
+  var mh = "";
+  MONTHS.forEach(function(mois){
+    var req = getRequiredForMonth(mois);
+    var payedM = Number(paidMap[mois] || 0);
+    var isFully = payedM >= req;
+    var nbT = tx.filter(function(t){ return t.mois === mois; }).length;
+    mh += '<div class="month-card" data-mois="'+esc(mois)+'">'+
+      '<div class="month-circle '+(isFully?"paid":"pending")+'">'+(isFully?"✓":"🕐")+'</div>'+
+      '<div class="m-info">'+
+        '<div class="mois">'+esc(mois)+'</div>'+
+        '<div class="detail">Payé : '+fmt(payedM)+' / '+fmt(req)+' FC'+(nbT>0?' • '+nbT+' paiement(s)':'')+'</div>'+
+      '</div>'+
+      '<div class="arrow">›</div>'+
+    '</div>';
+  });
+  listEl.innerHTML = mh;
+
+  Array.prototype.forEach.call(listEl.querySelectorAll(".month-card"), function(card){
+    card.addEventListener("click", function(){
+      var mois = card.getAttribute("data-mois");
+      var req = getRequiredForMonth(mois);
+      var payedM = Number(paidMap[mois] || 0);
+      showMonthDetail(mois, payedM, req, payedM >= req);
+    });
+  });
+}
+
+function summaryChip(label, amount, color){
+  return '<div class="summary-chip">'+
+    '<div class="lbl" style="color:'+color+'">'+esc(label)+'</div>'+
+    '<div class="val" style="color:'+color+'">'+fmt(amount)+' FC</div>'+
+  '</div>';
+}
+
+// ---- Modal détail du mois ----
+function showMonthDetail(mois, payed, required, isFullyPaid){
+  monthModalCtx = {mois:mois, payed:payed, required:required, isFullyPaid:isFullyPaid};
+  $("monthModalTitle").textContent = mois + " — " + currentChild.nom;
+
+  $("monthSummaryRow").innerHTML =
+    summaryChip("Requis", required, "var(--indigo)")+
+    summaryChip("Payé", payed, payed >= required ? "var(--green)" : "var(--orange)")+
+    summaryChip("Reste", Math.max(0, required-payed), (required-payed)>0 ? "var(--red)" : "var(--green)");
+
+  var monthTx = getTransactions().filter(function(t){ return t.mois === mois; });
+  monthTx.sort(function(a,b){ return String(a.date||"").localeCompare(String(b.date||"")); });
+
+  var txHtml = "";
+  if(!monthTx.length){
+    txHtml = '<div style="color:var(--grey);font-size:13px;">Aucun paiement enregistré pour ce mois.</div>';
+  } else {
+    monthTx.forEach(function(t){
+      var isFromParent = t.from_parent === true;
+      txHtml += '<div class="tx-item">'+
+        '<span class="tx-ic">'+(isFromParent?"📱":"🧾")+'</span>'+
+        '<div class="tx-mid">'+esc(t.date || "—")+
+          (isFromParent ? '<div class="tx-sub">via '+esc(t.network||"Mobile Money")+'</div>' : '')+
+        '</div>'+
+        '<div class="tx-amt">'+fmt(t.amount)+' FC</div>'+
+      '</div>';
+    });
+  }
+  $("monthTxList").innerHTML = txHtml;
+
+  var payBtn = $("btnGoPay");
+  payBtn.style.display = isFullyPaid ? "none" : "inline-flex";
+  openModal("modalMonth");
+}
+$("btnCloseMonth").addEventListener("click", function(){ closeModal("modalMonth"); });
+$("btnGoPay").addEventListener("click", function(){
+  closeModal("modalMonth");
+  openPayDialog(monthModalCtx.mois, monthModalCtx.required - monthModalCtx.payed);
+});
+
+// ---- Modal paiement ----
+function renderDistPreview(dist){
+  if(!dist.length){ $("distZone").innerHTML = ""; return; }
+  var total = dist.reduce(function(s,e){ return s + e.amount; }, 0);
+  var html = '<div class="dist-box"><div class="ttl">Répartition de votre paiement :</div>';
+  dist.forEach(function(e){
+    html += '<div class="dist-row"><span>📅 '+esc(e.mois)+'</span><span><b>'+fmt(e.amount)+' FC</b></span></div>';
+  });
+  html += '<div class="dist-total"><span>Total :</span><span>'+fmt(total)+' FC</span></div>';
+  if(dist.length > 1){
+    html += '<div class="dist-note">✅ Ce paiement couvre '+dist.length+' mois</div>';
+  }
+  html += '</div>';
+  $("distZone").innerHTML = html;
+}
+
+function updateSubmitState(){
+  var amount = parseFloat($("inputAmount").value);
+  $("btnSubmitPay").disabled = !selectedNetwork || !(amount > 0);
+}
+
+function openPayDialog(startMois, amountDue){
+  payModalCtx = {startMois: startMois, amountDue: amountDue};
+  selectedNetwork = null;
+  $("payModalTitle").textContent = "Payer — " + startMois;
+  $("payDueLine").textContent = "Reste à payer pour ce mois : " + fmt(amountDue) + " FC";
+  $("inputAmount").value = Math.round(amountDue);
+  Array.prototype.forEach.call($("netTiles").querySelectorAll(".net-tile"), function(t){ t.classList.remove("sel"); });
+  $("netInfoNote").innerHTML = "";
+  renderDistPreview(distributeAmount(startMois, amountDue));
+  updateSubmitState();
+  openModal("modalPay");
+}
+$("btnCancelPay").addEventListener("click", function(){ closeModal("modalPay"); });
+
+$("inputAmount").addEventListener("input", function(){
+  var amount = parseFloat($("inputAmount").value) || 0;
+  renderDistPreview(amount > 0 ? distributeAmount(payModalCtx.startMois, amount) : []);
+  updateSubmitState();
+});
+
+Array.prototype.forEach.call($("netTiles").querySelectorAll(".net-tile"), function(tile){
+  tile.addEventListener("click", function(){
+    Array.prototype.forEach.call($("netTiles").querySelectorAll(".net-tile"), function(t){ t.classList.remove("sel"); });
+    tile.classList.add("sel");
+    selectedNetwork = tile.getAttribute("data-net");
+    $("netInfoNote").innerHTML = '<div class="info-note">ℹ️ L\'intégration des paiements automatiques est en cours. '+
+      'Votre demande sera transmise à l\'école pour validation manuelle.</div>';
+    updateSubmitState();
+  });
+});
+
+$("btnSubmitPay").addEventListener("click", async function(){
+  var amount = parseFloat($("inputAmount").value);
+  if(!amount || amount <= 0 || !selectedNetwork) return;
+  var finalDist = distributeAmount(payModalCtx.startMois, amount);
+  if(!finalDist.length) return;
+
+  $("btnSubmitPay").disabled = true;
+  $("btnSubmitPay").textContent = "Envoi...";
+
+  var res = await apiPost("/parent/submit_mobile_payment", {
+    student_id: currentChild.id,
+    school_code: currentChild.schoolCode,
+    month_entries: finalDist,
+    network: selectedNetwork,
+    parent_name: currentChild.nom + " (parent)"
+  });
+
+  $("btnSubmitPay").textContent = "Envoyer la demande";
+  closeModal("modalPay");
+
+  if(res.success && res.data){
+    var monthsCovered = res.data.months_covered || finalDist.length;
+    showSuccessDialog(amount, selectedNetwork, monthsCovered, finalDist);
+  } else {
+    showToast("⚠️ " + ((res.data && res.data.error) || res.error || "Impossible d'envoyer. Réessayez."), "orange");
+  }
+});
+
+function showSuccessDialog(amount, network, monthsCovered, distribution){
+  var html = '<div class="success-line">Votre paiement de '+fmt(amount)+' FC via '+esc(network)+' a été transmis à l\'école.</div>';
+  if(monthsCovered > 1){
+    html += '<div style="font-weight:700;margin:10px 0 6px;">✅ '+monthsCovered+' mois couverts :</div>';
+    distribution.forEach(function(e){
+      html += '<div class="success-line">• '+esc(e.mois)+' : '+fmt(e.amount)+' FC</div>';
+    });
+  }
+  html += '<div class="footnote">Le paiement sera visible dans l\'historique après confirmation par l\'administration scolaire.<br><br>'+
+    '📌 Le paiement automatique sera activé dès l\'intégration des APIs Mobile Money.</div>';
+  $("successBody").innerHTML = html;
+  openModal("modalSuccess");
+}
+$("btnSuccessOk").addEventListener("click", function(){
+  closeModal("modalSuccess");
+  loadPayments(currentChild);
+});
+
+// ==================================================================
+// ONGLET DISCIPLINE
+// ==================================================================
+var TYPE_META = {
+  absence:      {color:"var(--orange)", icon:"🚫"},
+  convocation:  {color:"var(--red)",    icon:"⚖️"},
+  announcement: {color:"var(--blue)",   icon:"📢"},
+  autre:        {color:"var(--grey)",   icon:"✉️"}
+};
+
+async function loadMessages(child){
+  var el = $("disciplineContent");
+  el.innerHTML = '<div class="center-box"><div class="spinner"></div></div>';
+
+  var res = await apiGet("/parent/get_messages?student_id="+encodeURIComponent(child.id)+
+    "&school_code="+encodeURIComponent(child.schoolCode));
+
+  if(!res.success){
+    el.innerHTML =
+      '<div class="center-box"><div class="err-box">'+
+        '<div class="ic">⚠️</div>'+
+        '<div style="margin-bottom:16px;">'+esc((res.data && res.data.error) || res.error)+'</div>'+
+        '<button class="btn" id="btnRetryMsgs">🔄 Réessayer</button>'+
+      '</div></div>';
+    $("btnRetryMsgs").addEventListener("click", function(){ loadMessages(currentChild); });
+    return;
+  }
+  messages = res.data.messages || [];
+  renderDisciplineTab();
+}
+
+function renderDisciplineTab(){
+  var el = $("disciplineContent");
+  if(!messages.length){
+    el.innerHTML =
+      '<div class="center-box"><div style="text-align:center;">'+
+        '<div style="font-size:60px;color:#bdbdbd;">🔕</div>'+
+        '<h3 style="margin:14px 0 6px;">Aucun message</h3>'+
+        '<div style="color:var(--grey);margin-bottom:16px;">Pas d\'absence, convocation ou communiqué<br>pour le moment.</div>'+
+        '<button class="btn" id="btnRefreshMsgs">🔄 Actualiser</button>'+
+      '</div></div>';
+    $("btnRefreshMsgs").addEventListener("click", function(){ loadMessages(currentChild); });
+    return;
+  }
+
+  var html = '<div class="refresh-row"><button id="btnRefreshMsgs2">🔄 Actualiser</button></div><div class="msg-list" id="msgListEl"></div>';
+  el.innerHTML = html;
+  $("btnRefreshMsgs2").addEventListener("click", function(){ loadMessages(currentChild); });
+
+  var listEl = $("msgListEl");
+  var mh = "";
+  messages.forEach(function(m, i){
+    var meta = TYPE_META[m.type] || TYPE_META.autre;
+    var read = m.read === true;
+    mh += '<div class="msg-card '+(read?'':'unread')+'" data-idx="'+i+'">'+
+      '<div class="msg-ic" style="background:'+meta.color+'">'+meta.icon+'</div>'+
+      '<div class="msg-body">'+
+        '<div class="title '+(read?'':'b')+'">'+esc(m.title)+'</div>'+
+        '<div class="txt">'+esc(m.message)+'</div>'+
+        '<div class="date">'+esc(m.date)+'</div>'+
+      '</div>'+
+      (read?'':'<div class="msg-dot"></div>')+
+    '</div>';
+  });
+  listEl.innerHTML = mh;
+
+  Array.prototype.forEach.call(listEl.querySelectorAll(".msg-card"), function(card){
+    card.addEventListener("click", function(){
+      var idx = Number(card.getAttribute("data-idx"));
+      markAsRead(messages[idx]);
+    });
+  });
+}
+
+async function markAsRead(msg){
+  if(msg.read) return;
+  var res = await apiPost("/parent/mark_message_read", {
+    school_code: currentChild.schoolCode,
+    message_id: msg.id
+  });
+  if(res.success){
+    msg.read = true;
+    renderDisciplineTab();
+  }
+}
+
+// ==================================================================
+// INIT
+// ==================================================================
+loadChildren();
+
+})();
+</script>
+</body>
+</html>
