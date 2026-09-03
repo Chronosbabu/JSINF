@@ -1714,7 +1714,7 @@ def list_reconnection_keys():
 
 
 # ====================================================================
-# ⚡⚡⚡ NOUVEAU — CLÉS D'ACCÈS MULTI-USAGES ET MULTI-SECTIONS
+# ⚡⚡⚡ CLÉS D'ACCÈS MULTI-USAGES ET MULTI-SECTIONS
 # ====================================================================
 # Une clé encode désormais 4 informations :
 #   - school_code : l'école concernée
@@ -1728,11 +1728,21 @@ def list_reconnection_keys():
 #                   une classe n'appartient qu'à une seule section) —
 #                   None/"" = "toutes les classes de la/les section(s)"
 #
+# ⚡⚡⚡ NOUVEAU — durée de TRAVAIL après connexion :
+# `durationValue`/`durationUnit` sont désormais stockés avec chaque
+# clé et renvoyés par `/verify_key` à CHAQUE connexion. Ce ne sont PAS
+# des dates d'expiration de la clé : la clé reste valable pour se
+# CONNECTER indéfiniment (jusqu'à révocation via `/revoke_key`). C'est
+# à l'application cliente de démarrer, à partir de l'instant précis de
+# CETTE connexion, une fenêtre de travail de cette durée exacte.
+#
 # ⚡ RÉTROCOMPATIBILITÉ : les anciennes clés stockées avant cette
 # évolution n'ont qu'un champ "section" (chaîne) au lieu de "sections"
-# (liste). _key_sections() ci-dessous normalise les deux formats afin
-# que verify_key/list_keys continuent de fonctionner pour les clés déjà
-# distribuées, sans avoir à les régénérer.
+# (liste), et n'ont pas de champ "durationValue"/"durationUnit" du
+# tout. `_key_sections()` normalise les deux formats de section, et
+# `/verify_key` applique un repli sûr (30 jours) quand ces champs sont
+# absents, afin que les clés déjà distribuées continuent de fonctionner
+# sans avoir à être régénérées.
 # ====================================================================
 
 def _key_sections(info):
@@ -1804,6 +1814,21 @@ def generate_key():
                          f"{', '.join(sorted(KEY_TYPES))}"
             }), 400
 
+        # ⚡⚡⚡ NOUVEAU — durée de TRAVAIL autorisée après connexion,
+        # choisie par l'admin. Ce n'est PAS une expiration de la clé :
+        # la clé reste valable pour se connecter indéfiniment (voir
+        # /verify_key), seule la fenêtre de travail après connexion
+        # est limitée par ces valeurs.
+        try:
+            duration_value = int(data.get('duration_value', 30))
+        except (TypeError, ValueError):
+            duration_value = 30
+        if duration_value < 1:
+            duration_value = 1
+        duration_unit = (data.get('duration_unit') or 'days').strip().lower()
+        if duration_unit != 'minutes':
+            duration_unit = 'days'
+
         key = (
             f"{school_code.upper()}*{key_type}*{_sections_slug(sections)}"
             f"*{_slug(classe)}*{os.urandom(4).hex()}"
@@ -1821,11 +1846,18 @@ def generate_key():
             "section":     sections[0],
             "type":        key_type,
             "classe":      classe if classe else None,
+            # ⚡⚡⚡ NOUVEAU — durée de TRAVAIL choisie par l'admin,
+            # utilisée uniquement à partir de la connexion (voir
+            # /verify_key), jamais comme expiration de la clé.
+            "durationValue": duration_value,
+            "durationUnit":  duration_unit,
         }
         _save_json(KEYS_FILE, keys)
         logger.info(
-            "🔑 generate_key : école='%s' type='%s' sections=%s classe='%s' → clé générée",
+            "🔑 generate_key : école='%s' type='%s' sections=%s classe='%s' "
+            "durée_travail=%s %s → clé générée",
             school_code, key_type, sections, classe or "TOUTES",
+            duration_value, duration_unit,
         )
         return jsonify({
             "key":      key,
@@ -1833,6 +1865,9 @@ def generate_key():
             "section":  sections[0],
             "type":     key_type,
             "classe":   classe or None,
+            # ⚡⚡⚡ NOUVEAU — renvoyé pour affichage immédiat côté admin.
+            "duration_value": duration_value,
+            "duration_unit":  duration_unit,
         }), 200
     except Exception as e:
         logger.exception("Erreur generate_key")
@@ -1861,9 +1896,22 @@ def verify_key():
                 saved = json.load(f)
             school_name  = saved.get('config', {}).get('schoolName', school_code)
             current_year = saved.get('currentYear')
+
+        # ⚡⚡⚡ NOUVEAU — durée de TRAVAIL autorisée après CETTE
+        # connexion, telle que définie par l'admin à la génération de la
+        # clé. Repli sur 30 jours pour les clés générées AVANT l'ajout
+        # de cette fonctionnalité (elles n'ont pas ces champs stockés).
+        # La clé elle-même reste valable pour se connecter
+        # indéfiniment : ces valeurs ne servent qu'à armer, côté
+        # client, une fenêtre de travail à partir de maintenant.
+        duration_value = info.get('durationValue', 30)
+        duration_unit  = info.get('durationUnit', 'days')
+
         logger.info(
-            "verify_key : clé valide pour école='%s' type='%s' sections=%s classe='%s'",
+            "verify_key : clé valide pour école='%s' type='%s' sections=%s "
+            "classe='%s' durée_travail=%s %s",
             school_code, info.get('type', 'PAY'), sections, info.get('classe'),
+            duration_value, duration_unit,
         )
         return jsonify({
             "valid":        True,
@@ -1879,6 +1927,10 @@ def verify_key():
             "classe":       info.get("classe") if len(sections) == 1 else None,
             "school_name":  school_name,
             "current_year": current_year,
+            # ⚡⚡⚡ NOUVEAU — durée de TRAVAIL à démarrer par le client
+            # à partir de MAINTENANT (cette connexion précise).
+            "duration_value": duration_value,
+            "duration_unit":  duration_unit,
         }), 200
     except Exception as e:
         logger.exception("Erreur verify_key")
@@ -1905,9 +1957,10 @@ def revoke_key():
 
 @app.route('/list_keys', methods=['GET'])
 def list_keys():
-    """⚡⚡⚡ NOUVEAU — Liste toutes les clés actives d'une école, pour que
-    l'admin puisse voir/gérer (et révoquer) les clés déjà distribuées,
-    avec leur type, LEURS sections (liste) et classe."""
+    """⚡⚡⚡ Liste toutes les clés actives d'une école, pour que l'admin
+    puisse voir/gérer (et révoquer) les clés déjà distribuées, avec leur
+    type, LEURS sections (liste), classe, et désormais leur durée de
+    travail (`durationValue`/`durationUnit`)."""
     try:
         school_code = request.args.get('school_code')
         if not school_code:
@@ -1919,6 +1972,9 @@ def list_keys():
                 "type":     v.get("type", "PAY"),
                 "sections": _key_sections(v),
                 "classe":   v.get("classe"),
+                # ⚡⚡⚡ NOUVEAU
+                "durationValue": v.get("durationValue", 30),
+                "durationUnit":  v.get("durationUnit", "days"),
             }
             for k, v in keys.items()
             if v.get("school_code") == school_code
@@ -2662,7 +2718,7 @@ def admin_health():
 
 
 # ====================================================================
-# ⚡⚡⚡ NOUVEAU — RÉPARATION AUTOMATIQUE AU DÉMARRAGE DU SERVEUR
+# ⚡⚡⚡ RÉPARATION AUTOMATIQUE AU DÉMARRAGE DU SERVEUR
 # ====================================================================
 # S'exécute une fois, au chargement du module (donc aussi bien avec
 # `python3 school_server.py` qu'avec gunicorn sur Render). Répare
