@@ -1,3 +1,4 @@
+
 from flask import Flask, request, jsonify, send_from_directory
 import json
 import os
@@ -7,6 +8,8 @@ import secrets
 import string
 import logging
 import sys
+import firebase_admin
+from firebase_admin import credentials, messaging
 
 app = Flask(__name__)
 
@@ -26,6 +29,7 @@ SUBSCRIPTION_KEYS_FILE      = os.path.join(DATA_DIR, "subscription_keys.json")
 PROMOTER_SUMMARY_FILE       = os.path.join(DATA_DIR, "promoter_summary.json")
 PROMOTER_PENDING_REQUESTS_FILE  = os.path.join(DATA_DIR, "promoter_pending_requests.json")
 PROMOTER_RESOLVED_REQUESTS_FILE = os.path.join(DATA_DIR, "promoter_resolved_requests.json")
+FCM_TOKENS_FILE             = os.path.join(DATA_DIR, "fcm_tokens.json")
 
 ADMIN_PASSWORD = "edupay_admin_2026"
 
@@ -55,6 +59,7 @@ SYSTEM_FILES = {
     'subscription_keys.json',
     'promoter_summary.json', 'promoter_pending_requests.json',
     'promoter_resolved_requests.json',
+    'fcm_tokens.json',
 }
 
 logging.basicConfig(
@@ -64,6 +69,189 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 logger = logging.getLogger("edupay")
+
+
+# ====================================================================
+# FIREBASE ADMIN SDK — initialisation et notifications FCM
+# ====================================================================
+
+_firebase_app = None
+
+
+def _init_firebase():
+    """Initialise Firebase Admin SDK à partir de la variable d'environnement
+    FIREBASE_SERVICE_ACCOUNT (JSON du compte de service). Ne jamais logguer
+    le contenu de cette variable. N'échoue pas le démarrage du serveur si
+    la variable est absente ou invalide : les notifications seront alors
+    simplement désactivées (les autres fonctionnalités continuent de marcher)."""
+    global _firebase_app
+    raw = os.environ.get('FIREBASE_SERVICE_ACCOUNT', '')
+    if not raw:
+        logger.warning(
+            "⚠️ FIREBASE_SERVICE_ACCOUNT absente : les notifications FCM "
+            "sont désactivées."
+        )
+        return None
+    try:
+        service_account_info = json.loads(raw)
+        cred = credentials.Certificate(service_account_info)
+        _firebase_app = firebase_admin.initialize_app(cred)
+        logger.info("✅ Firebase Admin SDK initialisé avec succès.")
+        return _firebase_app
+    except Exception as e:
+        logger.error(
+            "❌ Erreur d'initialisation de Firebase Admin SDK "
+            "(vérifiez le format JSON de FIREBASE_SERVICE_ACCOUNT) : %s", e
+        )
+        return None
+
+
+def _firebase_ready():
+    return _firebase_app is not None
+
+
+def _load_json(path, default):
+    if os.path.exists(path):
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return default
+
+
+def _save_json(path, data):
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def _fcm_tokens_key(school_code):
+    return school_code.strip().lower()
+
+
+def register_fcm_token(school_code, role, token, platform):
+    """Enregistre (ou met à jour) un token FCM pour une école/role donnés.
+    Un même token ne sera jamais dupliqué dans la liste."""
+    if not school_code or not token:
+        return False
+
+    store       = _load_json(FCM_TOKENS_FILE, {})
+    school_key  = _fcm_tokens_key(school_code)
+    tokens_list = store.get(school_key, [])
+
+    now_iso = datetime.datetime.now().isoformat()
+
+    # Retire toute entrée existante avec le même token (pour la remettre à
+    # jour proprement, y compris si son rôle ou sa plateforme a changé).
+    tokens_list = [t for t in tokens_list if t.get('token') != token]
+
+    tokens_list.append({
+        "token":        token,
+        "role":         role or "unknown",
+        "platform":     platform or "unknown",
+        "updated_at":   now_iso,
+    })
+
+    store[school_key] = tokens_list
+    _save_json(FCM_TOKENS_FILE, store)
+
+    logger.info(
+        "📱 register_fcm_token : école='%s' role='%s' plateforme='%s'",
+        school_code, role, platform,
+    )
+    return True
+
+
+def _get_tokens_for_role(school_code, role=None):
+    store       = _load_json(FCM_TOKENS_FILE, {})
+    school_key  = _fcm_tokens_key(school_code)
+    tokens_list = store.get(school_key, [])
+    if role is None:
+        return [t.get('token') for t in tokens_list if t.get('token')]
+    return [
+        t.get('token') for t in tokens_list
+        if t.get('token') and t.get('role') == role
+    ]
+
+
+def _remove_invalid_tokens(school_code, invalid_tokens):
+    if not invalid_tokens:
+        return
+    store       = _load_json(FCM_TOKENS_FILE, {})
+    school_key  = _fcm_tokens_key(school_code)
+    tokens_list = store.get(school_key, [])
+    before      = len(tokens_list)
+    tokens_list = [
+        t for t in tokens_list if t.get('token') not in invalid_tokens
+    ]
+    store[school_key] = tokens_list
+    _save_json(FCM_TOKENS_FILE, store)
+    removed = before - len(tokens_list)
+    if removed:
+        logger.info(
+            "🧹 %d token(s) FCM invalide(s)/expiré(s) retiré(s) pour l'école '%s'",
+            removed, school_code,
+        )
+
+
+def send_fcm_to_tokens(tokens, title, body, data=None):
+    """Envoie une notification FCM à une liste de tokens. Retourne la liste
+    des tokens invalides/expirés détectés (à retirer par l'appelant)."""
+    if not _firebase_ready() or not tokens:
+        return []
+
+    data_payload = {k: str(v) for k, v in (data or {}).items()}
+    invalid_tokens = []
+
+    # L'API Admin SDK limite send_each_for_multicast à 500 tokens par appel.
+    batch_size = 500
+    for i in range(0, len(tokens), batch_size):
+        batch = tokens[i:i + batch_size]
+        message = messaging.MulticastMessage(
+            notification=messaging.Notification(title=title, body=body),
+            data=data_payload,
+            tokens=batch,
+        )
+        try:
+            response = messaging.send_each_for_multicast(message)
+        except Exception as e:
+            logger.error("❌ Erreur d'envoi FCM (batch) : %s", e)
+            continue
+
+        for idx, result in enumerate(response.responses):
+            if result.success:
+                continue
+            error = result.exception
+            code = getattr(error, 'code', '') or ''
+            msg  = str(error)
+            if ('UNREGISTERED' in msg or 'NOT_FOUND' in msg or
+                    'INVALID_ARGUMENT' in msg or code in
+                    ('NOT_FOUND', 'UNREGISTERED', 'INVALID_ARGUMENT')):
+                invalid_tokens.append(batch[idx])
+            else:
+                logger.warning(
+                    "⚠️ Échec d'envoi FCM pour un token (non retiré) : %s", msg
+                )
+
+    return invalid_tokens
+
+
+def notify_school_role(school_code, role, title, body, data=None):
+    """Fonction centrale : envoie une notification FCM à tous les
+    appareils enregistrés pour une école + un rôle donnés (ex: 'promoteur').
+    Nettoie automatiquement les tokens invalides après l'envoi."""
+    if not school_code:
+        return
+    tokens = _get_tokens_for_role(school_code, role)
+    if not tokens:
+        return
+    invalid = send_fcm_to_tokens(tokens, title, body, data)
+    if invalid:
+        _remove_invalid_tokens(school_code, invalid)
+
+
+def notify_multiple_schools(school_codes, role, title, body, data=None):
+    """Envoie la même notification à plusieurs écoles (même rôle) —
+    utile par exemple pour une annonce générale EduPay."""
+    for sc in school_codes:
+        notify_school_role(sc, role, title, body, data)
 
 
 def _log_startup_state():
@@ -89,19 +277,8 @@ def _log_startup_state():
         logger.error("Erreur lors du log de démarrage : %s", e)
 
 
+_init_firebase()
 _log_startup_state()
-
-
-def _load_json(path, default):
-    if os.path.exists(path):
-        with open(path, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return default
-
-
-def _save_json(path, data):
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
 
 
 def _generate_registration_id():
@@ -1101,6 +1278,15 @@ def _store_pending_mobile_payment(data):
         _save_json(MOBILE_PAYMENTS_FILE, mobile_store)
 
         total_sent = sum(e['amount'] for e in month_entries)
+
+        notify_school_role(
+            school_code, "promoteur",
+            "Nouveau paiement Mobile Money",
+            f"{eleve.get('nom','')} {eleve.get('postNom','')} — "
+            f"{total_sent:.0f} FC en attente de confirmation ({network}).",
+            data={"type": "mobile_payment", "school_code": school_code},
+        )
+
         return jsonify({
             "success":       True,
             "mode":          "manual",
@@ -2062,6 +2248,14 @@ def record_absences():
             )
             sent.append(sid)
 
+        if sent:
+            notify_school_role(
+                school_code, "promoteur",
+                "Absences enregistrées",
+                f"{len(sent)} élève(s) marqué(s) absent(s) — {classe or 'toutes classes'}.",
+                data={"type": "absences", "school_code": school_code},
+            )
+
         return jsonify({
             "message":        "Absences enregistrées et parents notifiés",
             "notified_count": len(sent),
@@ -2103,6 +2297,13 @@ def send_convocation():
 
         entry = _add_message_for_student(
             school_code, student_id, "convocation", title, message)
+
+        notify_school_role(
+            school_code, "promoteur",
+            "Convocation envoyée",
+            f"{title} — élève {student_id}.",
+            data={"type": "convocation", "school_code": school_code},
+        )
 
         return jsonify({"message": "Convocation envoyée", "id": entry["id"]}), 200
     except Exception as e:
@@ -2156,6 +2357,14 @@ def send_announcement():
                 extra={"nom_eleve": f"{e.get('nom','')} {e.get('postNom','')}".strip()},
             )
             sent.append(sid)
+
+        if sent:
+            notify_school_role(
+                school_code, "promoteur",
+                "Communiqué envoyé",
+                f"\"{title}\" envoyé à {len(sent)} élève(s).",
+                data={"type": "announcement", "school_code": school_code},
+            )
 
         return jsonify({
             "message":        "Communiqué envoyé",
@@ -2225,6 +2434,30 @@ def parent_mark_message_read():
 # ROUTES PROMOTEUR — résumé après sauvegarde + demandes d'approbation
 # ====================================================================
 
+@app.route('/school/register_fcm_token', methods=['POST'])
+def school_register_fcm_token():
+    """Appelée par l'application Flutter (promoteur, ou plus tard toute
+    autre app) après avoir récupéré/rafraîchi son token FCM."""
+    try:
+        data        = request.get_json()
+        school_code = (data.get('school_code') or '').strip()
+        role        = (data.get('role') or 'promoteur').strip()
+        token       = (data.get('token') or '').strip()
+        platform    = (data.get('platform') or '').strip()
+
+        if not school_code or not token:
+            return jsonify({"error": "Données manquantes"}), 400
+
+        ok = register_fcm_token(school_code, role, token, platform)
+        if not ok:
+            return jsonify({"error": "Échec de l'enregistrement du token"}), 500
+
+        return jsonify({"message": "Token FCM enregistré"}), 200
+    except Exception as e:
+        logger.exception("Erreur school_register_fcm_token")
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/school/push_promoter_summary', methods=['POST'])
 def push_promoter_summary():
     try:
@@ -2238,6 +2471,18 @@ def push_promoter_summary():
         store[school_code.lower()] = summary
         _save_json(PROMOTER_SUMMARY_FILE, store)
         logger.info("push_promoter_summary : école='%s' résumé mis à jour", school_code)
+
+        money_today = summary.get('moneyToday')
+        body = "Le tableau de bord vient d'être mis à jour."
+        if isinstance(money_today, (int, float)):
+            body = f"Argent aujourd'hui : {money_today:,.0f} FC — données mises à jour.".replace(',', ' ')
+        notify_school_role(
+            school_code, "promoteur",
+            "Nouvelles données disponibles",
+            body,
+            data={"type": "summary_update", "school_code": school_code},
+        )
+
         return jsonify({"message": "Résumé mis à jour"}), 200
     except Exception as e:
         logger.exception("Erreur push_promoter_summary")
@@ -2262,6 +2507,13 @@ def _new_promoter_request_id():
     return f"preq_{datetime.datetime.now().strftime('%Y%m%d%H%M%S%f')}_{os.urandom(3).hex()}"
 
 
+_PROMOTER_REQUEST_TYPE_LABELS = {
+    "reprint": "Demande de réimpression de reçu",
+    "modify":  "Demande de modification de paiement",
+    "cancel":  "Demande d'annulation de paiement",
+}
+
+
 @app.route('/school/create_promoter_request', methods=['POST'])
 def create_promoter_request():
     try:
@@ -2272,14 +2524,16 @@ def create_promoter_request():
             return jsonify({"error": "Données invalides"}), 400
 
         request_id = _new_promoter_request_id()
+        eleve_nom  = data.get('eleve_nom', '')
+        mois       = data.get('mois', '')
         entry = {
             "id":              request_id,
             "type":            req_type,
             "eleve_id":        data.get('eleve_id', ''),
-            "eleve_nom":       data.get('eleve_nom', ''),
+            "eleve_nom":       eleve_nom,
             "classe":          data.get('classe', ''),
             "section":         data.get('section', ''),
-            "mois":            data.get('mois', ''),
+            "mois":            mois,
             "transaction_id":  data.get('transaction_id', ''),
             "montant_actuel":  data.get('montant_actuel'),
             "nouveau_montant": data.get('nouveau_montant'),
@@ -2298,6 +2552,29 @@ def create_promoter_request():
             "📨 create_promoter_request : école='%s' type='%s' id='%s'",
             school_code, req_type, request_id,
         )
+
+        title = _PROMOTER_REQUEST_TYPE_LABELS.get(req_type, "Nouvelle demande")
+        body_parts = []
+        if eleve_nom:
+            body_parts.append(eleve_nom)
+        if mois:
+            body_parts.append(mois)
+        if req_type == 'modify' and data.get('nouveau_montant') is not None:
+            body_parts.append(f"→ {data.get('nouveau_montant'):.0f} FC")
+        body = " — ".join(str(p) for p in body_parts) or "Confirmation requise."
+
+        notify_school_role(
+            school_code, "promoteur",
+            title,
+            body,
+            data={
+                "type":       "promoter_request",
+                "request_id": request_id,
+                "request_type": req_type,
+                "school_code": school_code,
+            },
+        )
+
         return jsonify({"request_id": request_id}), 200
     except Exception as e:
         logger.exception("Erreur create_promoter_request")
@@ -2418,6 +2695,7 @@ def admin_health():
             "nb_ecoles":       len(details),
             "ecoles":          details,
             "subscription_mode": "TEST (1 minute)" if SUBSCRIPTION_TEST_MODE else "PRODUCTION (30 jours)",
+            "firebase_ready":  _firebase_ready(),
         }), 200
     except Exception as e:
         logger.exception("Erreur admin_health")
