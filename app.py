@@ -10,9 +10,6 @@ import sys
 
 app = Flask(__name__)
 
-# ====================================================================
-# ⚡⚡⚡ NOUVEAU — STOCKAGE SUR DISQUE PERSISTANT RENDER
-# ====================================================================
 DATA_DIR = os.environ.get("DATA_DIR", "/var/data/school_data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -26,6 +23,9 @@ MESSAGES_FILE                = os.path.join(DATA_DIR, "parent_messages.json")
 PENDING_REGISTRATIONS_FILE  = os.path.join(DATA_DIR, "pending_registrations.json")
 PENDING_AUTRES_FRAIS_FILE   = os.path.join(DATA_DIR, "pending_autres_frais.json")
 SUBSCRIPTION_KEYS_FILE      = os.path.join(DATA_DIR, "subscription_keys.json")
+PROMOTER_SUMMARY_FILE       = os.path.join(DATA_DIR, "promoter_summary.json")
+PROMOTER_PENDING_REQUESTS_FILE  = os.path.join(DATA_DIR, "promoter_pending_requests.json")
+PROMOTER_RESOLVED_REQUESTS_FILE = os.path.join(DATA_DIR, "promoter_resolved_requests.json")
 
 ADMIN_PASSWORD = "edupay_admin_2026"
 
@@ -53,6 +53,8 @@ SYSTEM_FILES = {
     'attendance_records.json', 'parent_messages.json',
     'pending_registrations.json', 'pending_autres_frais.json',
     'subscription_keys.json',
+    'promoter_summary.json', 'promoter_pending_requests.json',
+    'promoter_resolved_requests.json',
 }
 
 logging.basicConfig(
@@ -80,11 +82,8 @@ def _log_startup_state():
         )
         if not school_files:
             logger.warning(
-                "⚠️ Aucun fichier école trouvé au démarrage. Si vous aviez "
-                "déjà des écoles sauvegardées avant ce redémarrage, vérifiez "
-                "que le disque persistant Render est bien attaché à ce "
-                "service et monté sur '/var/data' — sinon les données "
-                "peuvent avoir été perdues (stockage éphémère)."
+                "⚠️ Aucun fichier école trouvé au démarrage. Vérifiez que "
+                "le disque persistant Render est bien attaché et monté."
             )
     except Exception as e:
         logger.error("Erreur lors du log de démarrage : %s", e)
@@ -190,14 +189,7 @@ def mobile_money_available():
     return bool(AIRTEL_API_KEY or ORANGE_API_KEY or VODACOM_API_KEY)
 
 
-# ====================================================================
-# ⚡⚡⚡ NOUVEAU — HELPERS ABONNEMENT / CLÉ DE RECONNEXION
-# ====================================================================
-
 def _find_in_schools_dict(schools, school_code):
-    """Recherche insensible à la casse d'une école dans un dict déjà
-    chargé (évite de relire le fichier plusieurs fois quand on a déjà
-    les données en mémoire)."""
     if not school_code:
         return None, None
     target = school_code.strip().upper()
@@ -214,38 +206,7 @@ def _find_school_entry(school_code):
     return _find_in_schools_dict(schools, school_code)
 
 
-# ====================================================================
-# ⚡⚡⚡ NOUVEAU — RÉPARATION DES ÉCOLES "ORPHELINES"
-# ====================================================================
-# PROBLÈME CORRIGÉ ICI :
-# Une école possède DEUX choses séparées sur le disque :
-#   1) son entrée dans schools_registry.json (nom, ville, directeur,
-#      abonnement...) — c'est SEULEMENT ce fichier que lit
-#      /admin/list_schools, donc ce que voit le panneau admin.
-#   2) son fichier de données réel {code_ecole}.json (élèves, paiements,
-#      config...) — écrit par /school/activate puis mis à jour par
-#      /backup à chaque sauvegarde depuis l'app de l'école.
-#
-# Si le serveur redémarre AVANT l'achat du disque persistant (stockage
-# éphémère), schools_registry.json peut être perdu alors que l'école,
-# elle, continue d'utiliser l'application normalement et d'envoyer des
-# /backup. Ces /backup recréent bien {code_ecole}.json sur le disque
-# (les données de l'école existent donc réellement), mais PERSONNE ne
-# recrée l'entrée correspondante dans schools_registry.json. Résultat :
-# la liste des écoles (/admin/list_schools) ne montre jamais cette
-# école, même après avoir payé le disque persistant, puisqu'elle ne
-# regarde que le registre — jamais les fichiers de données eux-mêmes.
-#
-# _register_orphan_school_file() régénère l'entrée manquante du
-# registre à partir du fichier de données réel de l'école, dès qu'on la
-# détecte (à chaque /backup, et par un balayage complet au démarrage du
-# serveur ainsi qu'à chaque appel de /admin/list_schools).
-# ====================================================================
-
 def _register_orphan_school_file(school_code, fpath=None):
-    """Si 'school_code' n'a pas d'entrée dans schools_registry.json,
-    la recrée à partir de son fichier de données réel sur le disque.
-    Renvoie True si une entrée a été (re)créée, False sinon."""
     if not school_code:
         return False
 
@@ -297,47 +258,33 @@ def _register_orphan_school_file(school_code, fpath=None):
         "activated":       True,
         "registered_at":   mtime,
         "activated_at":    mtime,
-        # ⚡ On ne connaît pas la vraie date de fin d'abonnement de cette
-        # école récupérée : on la traite comme illimitée par défaut
-        # (elle ne sera jamais bloquée toute seule). Générez-lui une
-        # clé de reconnexion normalement si vous voulez lui fixer une
-        # nouvelle période d'abonnement de 30 jours.
         "subscription_started_at": None,
         "subscription_expires_at": None,
         "subscription_blocked":    False,
-        # Marqueur informatif : cette entrée a été reconstituée
-        # automatiquement à partir du fichier de données, pas via le
-        # parcours normal d'enregistrement + activation.
         "recovered":       True,
     }
     _save_json(SCHOOLS_FILE, schools)
     logger.warning(
-        "🩹 École orpheline réenregistrée automatiquement dans le "
-        "registre : code='%s' nom='%s' (source='%s')",
+        "🩹 École orpheline réenregistrée automatiquement : code='%s' "
+        "nom='%s' (source='%s')",
         code_upper, schools[code_upper]['school_name'], fpath,
     )
     return True
 
 
 def _sync_orphan_schools():
-    """Balaye tous les fichiers école présents sur le disque et
-    réenregistre dans schools_registry.json tous ceux qui n'y figurent
-    pas encore. Appelé au démarrage du serveur (pour réparer d'un coup
-    toutes les écoles perdues avant l'achat du disque persistant) ainsi
-    qu'à chaque consultation de la liste des écoles, par sécurité."""
     try:
         nb_reparees = 0
         for fname in os.listdir(DATA_DIR):
             if not fname.endswith('.json') or fname in SYSTEM_FILES:
                 continue
-            school_code = fname[:-5]  # retire l'extension '.json'
+            school_code = fname[:-5]
             fpath = os.path.join(DATA_DIR, fname)
             if _register_orphan_school_file(school_code, fpath):
                 nb_reparees += 1
         if nb_reparees:
             logger.info(
-                "🩹 _sync_orphan_schools : %d école(s) orpheline(s) "
-                "réparée(s) et réintégrée(s) au registre.",
+                "🩹 _sync_orphan_schools : %d école(s) réparée(s).",
                 nb_reparees,
             )
     except Exception:
@@ -406,9 +353,6 @@ def _compute_subscription_status(school):
     }
 
 
-# ====================================================================
-# DISTRIBUTION MULTI-MOIS (logique identique à handlePayment Flutter)
-# ====================================================================
 def _get_required_for_month(config, section, mois):
     exceptions = config.get('monthlyExceptionsBySection', {}).get(section, {})
     if mois in exceptions:
@@ -445,15 +389,6 @@ def _distribute_payment(config, eleve, start_mois, total_amount):
     return entries
 
 
-# ====================================================================
-# ⚡⚡⚡ NOUVEAU — CORS (pour permettre à la version web parent.html,
-# éventuellement hébergée sur un domaine différent — GitHub Pages ou
-# autre — d'appeler ce serveur depuis le navigateur). N'affecte AUCUNE
-# route existante : on se contente d'ajouter des en-têtes sur chaque
-# réponse, sans rien changer au routage ni à la logique métier. L'app
-# Flutter (mobile/desktop) n'est pas concernée par CORS et continue de
-# fonctionner exactement comme avant.
-# ====================================================================
 @app.after_request
 def _add_cors_headers(response):
     response.headers['Access-Control-Allow-Origin'] = '*'
@@ -463,9 +398,6 @@ def _add_cors_headers(response):
     return response
 
 
-# ====================================================================
-# ⚡ LOG DE CHAQUE REQUÊTE ENTRANTE
-# ====================================================================
 @app.before_request
 def _log_incoming_request():
     logger.info(
@@ -474,17 +406,6 @@ def _log_incoming_request():
     )
 
 
-# ====================================================================
-# ⚡⚡⚡ NOUVEAU — VERSION WEB PARENT (parent.html)
-# ====================================================================
-# Sert le fichier statique 'parent.html' placé à côté de ce script dans
-# le dépôt, pour que les parents puissent enregistrer l'ID de leur
-# enfant et suivre paiements + discipline directement depuis un
-# navigateur, sans installer l'app Flutter. Le fichier appelle les
-# MÊMES routes /parent/... déjà utilisées par l'app mobile, donc aucune
-# route existante n'est modifiée ; on ajoute seulement deux façons
-# d'accéder à ce fichier statique.
-# ====================================================================
 _WEB_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -497,10 +418,6 @@ def serve_parent_html():
 def serve_parent_html_alias():
     return send_from_directory(_WEB_DIR, 'parent.html')
 
-
-# ====================================================================
-# ENREGISTREMENT DES ÉCOLES
-# ====================================================================
 
 @app.route('/admin/register_school', methods=['POST'])
 def admin_register_school():
@@ -582,10 +499,6 @@ def verify_registration_id():
         for school_code, school in schools.items():
             if school.get('registration_id', '').upper() == reg_id:
                 if school.get('activated'):
-                    logger.info(
-                        "verify_registration_id : reg_id='%s' déjà utilisé (code='%s')",
-                        reg_id, school_code,
-                    )
                     return jsonify({
                         "valid":       False,
                         "already_used": True,
@@ -593,10 +506,6 @@ def verify_registration_id():
                         "school_name": school.get('school_name'),
                         "error":       "Cet ID a déjà été utilisé.",
                     }), 200
-                logger.info(
-                    "verify_registration_id : reg_id='%s' valide (code='%s')",
-                    reg_id, school_code,
-                )
                 return jsonify({
                     "valid":        True,
                     "school_code":  school_code,
@@ -608,7 +517,6 @@ def verify_registration_id():
                     "bank_account": school.get('bank_account'),
                 }), 200
 
-        logger.warning("verify_registration_id : reg_id='%s' introuvable", reg_id)
         return jsonify({
             "valid": False,
             "error": "ID invalide. Vérifiez auprès de l'administrateur EduPay.",
@@ -629,10 +537,6 @@ def get_info_by_reg_id():
         schools = _load_json(SCHOOLS_FILE, {})
         for school_code, school in schools.items():
             if school.get('registration_id', '').upper() == reg_id:
-                logger.info(
-                    "get_info_by_reg_id : reg_id='%s' → code='%s'",
-                    reg_id, school_code,
-                )
                 return jsonify({
                     "found":        True,
                     "school_code":  school_code,
@@ -640,7 +544,6 @@ def get_info_by_reg_id():
                     "activated":    school.get('activated', False),
                 }), 200
 
-        logger.warning("get_info_by_reg_id : reg_id='%s' introuvable", reg_id)
         return jsonify({"found": False}), 404
     except Exception as e:
         logger.exception("Erreur get_info_by_reg_id")
@@ -662,16 +565,11 @@ def activate_school():
         for sc, school in schools.items():
             if school.get('registration_id', '').upper() == reg_id:
                 if school.get('activated'):
-                    logger.warning(
-                        "activate_school : reg_id='%s' déjà activé (code='%s')",
-                        reg_id, sc,
-                    )
                     return jsonify({"error": "Cet ID a déjà été utilisé."}), 400
                 target_code = sc
                 break
 
         if not target_code:
-            logger.warning("activate_school : reg_id='%s' invalide", reg_id)
             return jsonify({"error": "ID invalide"}), 404
 
         schools[target_code]['activated']    = True
@@ -712,16 +610,6 @@ def activate_school():
             }
             with open(filepath, 'w', encoding='utf-8') as f:
                 json.dump(initial_data, f, ensure_ascii=False, indent=2)
-            logger.info(
-                "✅ École activée + fichier initial créé : code='%s' nom='%s' path='%s'",
-                target_code, final_name, filepath,
-            )
-        else:
-            logger.info(
-                "✅ École activée (fichier déjà existant) : code='%s' nom='%s'",
-                target_code, final_name,
-            )
-
         return jsonify({
             "message":     "Compte activé avec succès. Bienvenue sur EduPay !",
             "school_code": target_code,
@@ -741,13 +629,6 @@ def list_schools():
         if data.get('admin_password') != ADMIN_PASSWORD:
             return jsonify({"error": "Accès refusé"}), 401
 
-        # ⚡⚡⚡ CORRECTION DU BUG — avant de construire la liste, on
-        # répare d'abord le registre en y réintégrant toute école dont
-        # le fichier de données existe sur le disque mais qui n'a plus
-        # d'entrée dans schools_registry.json (ex: école créée avant
-        # l'achat du disque persistant, dont le registre a été perdu à
-        # un redémarrage, mais dont les sauvegardes /backup ont
-        # continué d'arriver).
         _sync_orphan_schools()
 
         schools = _load_json(SCHOOLS_FILE, {})
@@ -762,16 +643,11 @@ def list_schools():
             "subscription":  _compute_subscription_status(s),
             "recovered":     s.get('recovered', False),
         } for sc, s in schools.items()]
-        logger.info("list_schools : %d école(s) enregistrée(s)", len(summary))
         return jsonify({"schools": summary, "total": len(summary)}), 200
     except Exception as e:
         logger.exception("Erreur list_schools")
         return jsonify({"error": str(e)}), 500
 
-
-# ====================================================================
-# BACKUP / RESTORE
-# ====================================================================
 
 @app.route('/backup', methods=['POST'])
 def backup():
@@ -780,17 +656,7 @@ def backup():
         school_code = data.get('school_code')
         backup_data = data.get('data')
         if not school_code or not backup_data:
-            logger.warning("backup : données invalides reçues (school_code ou data manquant)")
             return jsonify({"error": "Données invalides"}), 400
-
-        nb_eleves = sum(
-            len(yd.get('eleves', []))
-            for yd in backup_data.get('history', {}).values()
-        )
-        logger.info(
-            "📥 BACKUP reçu : école='%s' | %d élève(s) | années=%s",
-            school_code, nb_eleves, list(backup_data.get('history', {}).keys()),
-        )
 
         corrected_data, corrections = _resolve_id_conflicts(
             school_code, backup_data)
@@ -799,24 +665,9 @@ def backup():
         with open(filepath, 'w', encoding='utf-8') as f:
             json.dump(corrected_data, f, ensure_ascii=False, indent=2)
 
-        file_size = os.path.getsize(filepath) if os.path.exists(filepath) else 0
-        logger.info(
-            "✅ BACKUP écrit avec succès : école='%s' path='%s' taille=%d octets "
-            "| %d correction(s) d'ID",
-            school_code, filepath, file_size, len(corrections),
-        )
-
-        # ⚡⚡⚡ CORRECTION DU BUG — si cette école n'a pas (ou plus)
-        # d'entrée dans schools_registry.json (registre perdu à un
-        # ancien redémarrage avant le disque persistant, par exemple),
-        # on la réenregistre immédiatement à partir de ses propres
-        # données qu'on vient d'écrire. Elle redevient ainsi visible
-        # dans /admin/list_schools dès ce backup, sans attendre un
-        # redémarrage du serveur.
         if _register_orphan_school_file(school_code, filepath):
             logger.info(
-                "🩹 backup : école='%s' réintégrée au registre au moment "
-                "de la sauvegarde (elle n'y était plus).",
+                "🩹 backup : école='%s' réintégrée au registre.",
                 school_code,
             )
 
@@ -828,7 +679,7 @@ def backup():
             "subscription": _compute_subscription_status(school_entry),
         }), 200
     except Exception as e:
-        logger.exception("❌ Erreur lors du BACKUP pour école='%s'", request.get_json(silent=True) or {})
+        logger.exception("❌ Erreur lors du BACKUP")
         return jsonify({"error": str(e)}), 500
 
 
@@ -836,34 +687,17 @@ def backup():
 def restore():
     school_code = request.args.get('school_code')
     if not school_code:
-        logger.warning("restore : code manquant")
         return jsonify({"error": "Code manquant"}), 400
     filepath = os.path.join(DATA_DIR, f"{school_code.lower()}.json")
     if os.path.exists(filepath):
         with open(filepath, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        nb_eleves = sum(
-            len(yd.get('eleves', []))
-            for yd in data.get('history', {}).values()
-        )
-        logger.info(
-            "📤 RESTORE : école='%s' trouvée | %d élève(s)",
-            school_code, nb_eleves,
-        )
         data.pop('backup_password', None)
         _, school_entry = _find_school_entry(school_code)
         data['subscription'] = _compute_subscription_status(school_entry)
         return jsonify(data), 200
-    logger.warning(
-        "❌ RESTORE : aucune sauvegarde trouvée pour école='%s' (fichier attendu : '%s')",
-        school_code, filepath,
-    )
     return jsonify({"error": "Aucune sauvegarde trouvée"}), 404
 
-
-# ====================================================================
-# PAIEMENTS EN ATTENTE (sous-utilisateur — clé de type PAY)
-# ====================================================================
 
 @app.route('/record_payment', methods=['POST'])
 def record_payment():
@@ -880,7 +714,6 @@ def record_payment():
 
         filepath = os.path.join(DATA_DIR, f"{school_code.lower()}.json")
         if not os.path.exists(filepath):
-            logger.warning("record_payment : école introuvable code='%s'", school_code)
             return jsonify({"error": "École introuvable"}), 404
 
         with open(filepath, 'r', encoding='utf-8') as f:
@@ -920,11 +753,6 @@ def record_payment():
         pending_store[school_key] = pending_list
         _save_json(PENDING_FILE, pending_store)
 
-        logger.info(
-            "💰 record_payment : école='%s' élève='%s' mois='%s' montant=%s → pending_id='%s'",
-            school_code, eleve_id, mois, amount, payment_id,
-        )
-
         return jsonify({
             "message":    "Paiement reçu, en attente de validation",
             "pending_id": payment_id
@@ -942,10 +770,6 @@ def get_pending_payments():
             return jsonify({"error": "Code manquant"}), 400
         pending_store = _load_json(PENDING_FILE, {})
         pending_list  = pending_store.get(school_code.lower(), [])
-        logger.info(
-            "get_pending_payments : école='%s' → %d en attente",
-            school_code, len(pending_list),
-        )
         return jsonify({"pending_payments": pending_list}), 200
     except Exception as e:
         logger.exception("Erreur get_pending_payments")
@@ -965,7 +789,6 @@ def validate_payments():
         school_key = school_code.lower()
         filepath   = os.path.join(DATA_DIR, f"{school_key}.json")
         if not os.path.exists(filepath):
-            logger.warning("validate_payments : école introuvable code='%s'", school_code)
             return jsonify({"error": "École introuvable"}), 404
 
         with open(filepath, 'r', encoding='utf-8') as f:
@@ -1011,11 +834,6 @@ def validate_payments():
         pending_store[school_key] = remaining
         _save_json(PENDING_FILE, pending_store)
 
-        logger.info(
-            "✅ validate_payments : école='%s' | %d validé(s) | %d restant(s)",
-            school_code, validated_count, len(remaining),
-        )
-
         return jsonify({
             "message":           "Paiements validés",
             "validated_count":   validated_count,
@@ -1041,16 +859,11 @@ def reject_payment():
         pending_list  = [p for p in pending_list if p.get('id') != payment_id]
         pending_store[school_key] = pending_list
         _save_json(PENDING_FILE, pending_store)
-        logger.info("reject_payment : école='%s' payment_id='%s' rejeté", school_code, payment_id)
         return jsonify({"message": "Paiement rejeté"}), 200
     except Exception as e:
         logger.exception("Erreur reject_payment")
         return jsonify({"error": str(e)}), 500
 
-
-# ====================================================================
-# PAIEMENTS MOBILE MONEY (parent) — AVEC DISTRIBUTION MULTI-MOIS
-# ====================================================================
 
 @app.route('/payment/status', methods=['GET'])
 def payment_status():
@@ -1069,27 +882,19 @@ def parent_find_student():
     try:
         student_id = request.args.get('student_id', '').strip().upper()
         if not student_id:
-            logger.warning("parent_find_student : ID manquant dans la requête")
             return jsonify({"found": False, "error": "ID manquant"}), 400
-
-        logger.info("👨‍👩‍👧 parent_find_student : recherche de l'ID '%s'", student_id)
 
         fichiers_ecoles = [
             f for f in os.listdir(DATA_DIR)
             if f.endswith('.json') and f not in SYSTEM_FILES
         ]
-        logger.info(
-            "parent_find_student : %d fichier(s) école à scanner : %s",
-            len(fichiers_ecoles), fichiers_ecoles,
-        )
 
         for fname in fichiers_ecoles:
             fpath = os.path.join(DATA_DIR, fname)
             try:
                 with open(fpath, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-            except Exception as e:
-                logger.error("parent_find_student : impossible de lire '%s' : %s", fpath, e)
+            except Exception:
                 continue
 
             school_code  = fname.replace('.json', '').upper()
@@ -1100,10 +905,6 @@ def parent_find_student():
             for yd in data.get('history', {}).values():
                 for e in yd.get('eleves', []):
                     if e.get('id', '').upper() == student_id:
-                        logger.info(
-                            "✅ parent_find_student : ID '%s' TROUVÉ dans école='%s' (%s)",
-                            student_id, school_code, school_name,
-                        )
                         return jsonify({
                             "found":   True,
                             "student": {
@@ -1125,10 +926,6 @@ def parent_find_student():
                             }
                         }), 200
 
-        logger.warning(
-            "❌ parent_find_student : ID '%s' INTROUVABLE dans les %d fichier(s) scanné(s)",
-            student_id, len(fichiers_ecoles),
-        )
         return jsonify({
             "found": False,
             "error": "Aucun élève trouvé avec cet ID"
@@ -1146,17 +943,8 @@ def parent_get_payment_history():
         if not student_id or not school_code:
             return jsonify({"error": "Paramètres manquants"}), 400
 
-        logger.info(
-            "parent_get_payment_history : élève='%s' école='%s'",
-            student_id, school_code,
-        )
-
         filepath = os.path.join(DATA_DIR, f"{school_code.lower()}.json")
         if not os.path.exists(filepath):
-            logger.warning(
-                "parent_get_payment_history : école introuvable code='%s' (path='%s')",
-                school_code, filepath,
-            )
             return jsonify({"error": "École introuvable"}), 404
 
         with open(filepath, 'r', encoding='utf-8') as f:
@@ -1168,10 +956,6 @@ def parent_get_payment_history():
 
         for e in year_data.get('eleves', []):
             if e.get('id', '').upper() == student_id:
-                logger.info(
-                    "✅ parent_get_payment_history : historique trouvé pour élève='%s'",
-                    student_id,
-                )
                 return jsonify({
                     "paid":               e.get('paid', {}),
                     "transactions":       e.get('transactions', []),
@@ -1181,10 +965,6 @@ def parent_get_payment_history():
                     "current_year":       current_year,
                 }), 200
 
-        logger.warning(
-            "❌ parent_get_payment_history : élève='%s' introuvable dans école='%s'",
-            student_id, school_code,
-        )
         return jsonify({"error": "Élève introuvable"}), 404
     except Exception as e:
         logger.exception("Erreur parent_get_payment_history")
@@ -1224,11 +1004,6 @@ def parent_preview_payment():
         total_covered = sum(d['amount'] for d in distribution)
         remainder     = amount - total_covered
 
-        logger.info(
-            "parent_preview_payment : élève='%s' montant=%s → %d mois couverts",
-            student_id, amount, len(distribution),
-        )
-
         return jsonify({
             "distribution": distribution,
             "total_covered": total_covered,
@@ -1259,19 +1034,11 @@ def _store_pending_mobile_payment(data):
         start_mois    = data.get('mois')
         total_amount  = data.get('amount', 0)
 
-        logger.info(
-            "💳 submit_mobile_payment : élève='%s' école='%s' réseau='%s'",
-            student_id, school_code, network,
-        )
-
         if not student_id or not school_code:
             return jsonify({"error": "Données manquantes"}), 400
 
         filepath = os.path.join(DATA_DIR, f"{school_code.lower()}.json")
         if not os.path.exists(filepath):
-            logger.warning(
-                "submit_mobile_payment : école introuvable code='%s'", school_code,
-            )
             return jsonify({"error": "École introuvable"}), 404
 
         with open(filepath, 'r', encoding='utf-8') as f:
@@ -1285,10 +1052,6 @@ def _store_pending_mobile_payment(data):
             (e for e in year_data.get('eleves', [])
              if e.get('id', '').upper() == student_id), None)
         if eleve is None:
-            logger.warning(
-                "submit_mobile_payment : élève='%s' introuvable dans école='%s'",
-                student_id, school_code,
-            )
             return jsonify({"error": "Élève introuvable"}), 404
 
         if not month_entries:
@@ -1338,10 +1101,6 @@ def _store_pending_mobile_payment(data):
         _save_json(MOBILE_PAYMENTS_FILE, mobile_store)
 
         total_sent = sum(e['amount'] for e in month_entries)
-        logger.info(
-            "✅ submit_mobile_payment : élève='%s' | %d mois créés | total=%s",
-            student_id, len(month_entries), total_sent,
-        )
         return jsonify({
             "success":       True,
             "mode":          "manual",
@@ -1364,10 +1123,6 @@ def get_mobile_payments():
             return jsonify({"error": "Code manquant"}), 400
         mobile_store = _load_json(MOBILE_PAYMENTS_FILE, {})
         mobile_list  = mobile_store.get(school_code.lower(), [])
-        logger.info(
-            "get_mobile_payments : école='%s' → %d paiement(s) mobile en attente",
-            school_code, len(mobile_list),
-        )
         return jsonify({
             "mobile_payments": mobile_list,
             "count":           len(mobile_list)
@@ -1390,7 +1145,6 @@ def confirm_mobile_payments():
         school_key = school_code.lower()
         filepath   = os.path.join(DATA_DIR, f"{school_key}.json")
         if not os.path.exists(filepath):
-            logger.warning("confirm_mobile_payments : école introuvable code='%s'", school_code)
             return jsonify({"error": "École introuvable"}), 404
 
         with open(filepath, 'r', encoding='utf-8') as f:
@@ -1438,11 +1192,6 @@ def confirm_mobile_payments():
         mobile_store[school_key] = remaining
         _save_json(MOBILE_PAYMENTS_FILE, mobile_store)
 
-        logger.info(
-            "✅ confirm_mobile_payments : école='%s' | %d confirmé(s) | %d restant(s)",
-            school_code, confirmed_count, len(remaining),
-        )
-
         return jsonify({
             "message":         "Paiements confirmés",
             "confirmed_count": confirmed_count,
@@ -1453,14 +1202,9 @@ def confirm_mobile_payments():
         return jsonify({"error": str(e)}), 500
 
 
-# ====================================================================
-# WEBHOOKS (à remplir quand les APIs arrivent)
-# ====================================================================
-
 @app.route('/webhook/airtel', methods=['POST'])
 def webhook_airtel():
     data = request.get_json()
-    logger.info("webhook_airtel reçu : status='%s'", data.get('status'))
     if data.get('status') != 'SUCCESS':
         return jsonify({"ok": True}), 200
     ref   = data.get('transaction', {}).get('id', '')
@@ -1515,16 +1259,8 @@ def _auto_confirm_payment(eleve_id, mois, amount, network):
             })
             with open(fpath, 'w', encoding='utf-8') as f:
                 json.dump(saved, f, ensure_ascii=False, indent=2)
-            logger.info(
-                "✅ _auto_confirm_payment : élève='%s' mois='%s' montant=%s (réseau=%s)",
-                eleve_id, mois, amount, network,
-            )
             return
 
-
-# ====================================================================
-# AUTRES ROUTES
-# ====================================================================
 
 @app.route('/verify_password', methods=['POST'])
 def verify_password():
@@ -1541,28 +1277,19 @@ def verify_password():
             if saved_data.get('backup_password') == password:
                 _, school_entry = _find_school_entry(school_code)
                 subscription = _compute_subscription_status(school_entry)
-                logger.info(
-                    "verify_password : école='%s' mot de passe OK | abonnement_valide=%s",
-                    school_code, subscription['valid'],
-                )
                 return jsonify({
                     "valid":        True,
                     "subscription": subscription,
+                    "school_name": saved_data.get('config', {}).get('schoolName', school_code),
                 }), 200
-            logger.warning("verify_password : mot de passe incorrect pour école='%s'", school_code)
             return jsonify({
                 "valid": False, "error": "Mot de passe incorrect"
             }), 401
-        logger.warning("verify_password : aucune sauvegarde pour école='%s'", school_code)
         return jsonify({"error": "Aucune sauvegarde trouvée"}), 404
     except Exception as e:
         logger.exception("Erreur verify_password")
         return jsonify({"error": str(e)}), 500
 
-
-# ====================================================================
-# ⚡⚡⚡ NOUVEAU — ROUTES ABONNEMENT / CLÉ DE RECONNEXION
-# ====================================================================
 
 @app.route('/school/check_subscription', methods=['GET'])
 def check_subscription():
@@ -1572,13 +1299,8 @@ def check_subscription():
             return jsonify({"error": "Code manquant"}), 400
         _, school = _find_school_entry(school_code)
         if not school:
-            logger.warning("check_subscription : école introuvable code='%s'", school_code)
             return jsonify({"error": "École introuvable"}), 404
         status = _compute_subscription_status(school)
-        logger.info(
-            "check_subscription : école='%s' valide=%s restant=%ss",
-            school_code, status['valid'], status.get('seconds_remaining'),
-        )
         return jsonify(status), 200
     except Exception as e:
         logger.exception("Erreur check_subscription")
@@ -1590,7 +1312,6 @@ def generate_reconnection_key():
     try:
         data = request.get_json()
         if data.get('admin_password') != ADMIN_PASSWORD:
-            logger.warning("generate_reconnection_key : mot de passe admin incorrect")
             return jsonify({"error": "Mot de passe admin incorrect"}), 401
 
         school_code = (data.get('school_code') or '').strip()
@@ -1614,11 +1335,6 @@ def generate_reconnection_key():
             "used_at":     None,
         }
         _save_json(SUBSCRIPTION_KEYS_FILE, keys_store)
-
-        logger.info(
-            "🔑 generate_reconnection_key : école='%s' → clé générée='%s'",
-            real_code, key,
-        )
 
         return jsonify({
             "key":         key,
@@ -1648,24 +1364,12 @@ def redeem_reconnection_key():
         key_info   = keys_store.get(key)
 
         if not key_info:
-            logger.warning(
-                "redeem_reconnection_key : clé introuvable pour école='%s'",
-                school_code,
-            )
             return jsonify({"error": "Clé de reconnexion invalide"}), 404
 
         if key_info.get('used'):
-            logger.warning(
-                "redeem_reconnection_key : clé déjà utilisée (école='%s')",
-                school_code,
-            )
             return jsonify({"error": "Cette clé a déjà été utilisée"}), 400
 
         if key_info.get('school_code', '').upper() != real_code.upper():
-            logger.warning(
-                "redeem_reconnection_key : clé ne correspond pas à l'école='%s'",
-                school_code,
-            )
             return jsonify({
                 "error": "Cette clé ne correspond pas à cette école"
             }), 400
@@ -1678,11 +1382,6 @@ def redeem_reconnection_key():
         key_info['used_at'] = datetime.datetime.now().isoformat()
         keys_store[key]     = key_info
         _save_json(SUBSCRIPTION_KEYS_FILE, keys_store)
-
-        logger.info(
-            "✅ redeem_reconnection_key : école='%s' réactivée jusqu'à '%s'",
-            real_code, schools[real_code].get('subscription_expires_at'),
-        )
 
         return jsonify({
             "message":    "Abonnement réactivé avec succès",
@@ -1713,42 +1412,7 @@ def list_reconnection_keys():
         return jsonify({"error": str(e)}), 500
 
 
-# ====================================================================
-# ⚡⚡⚡ CLÉS D'ACCÈS MULTI-USAGES ET MULTI-SECTIONS
-# ====================================================================
-# Une clé encode désormais 4 informations :
-#   - school_code : l'école concernée
-#   - type        : PAY | DISC | INSC | AFR (ce que le sous-utilisateur
-#                   peut faire une fois connecté avec cette clé)
-#   - sections    : UNE LISTE d'une ou plusieurs sections/options sur
-#                   lesquelles il peut travailler et BASCULER librement
-#                   une fois connecté (ex: ["Primaire", "Secondaire"])
-#   - classe      : une classe précise, UNIQUEMENT possible quand une
-#                   seule section est choisie (sinon toujours None, car
-#                   une classe n'appartient qu'à une seule section) —
-#                   None/"" = "toutes les classes de la/les section(s)"
-#
-# ⚡⚡⚡ NOUVEAU — durée de TRAVAIL après connexion :
-# `durationValue`/`durationUnit` sont désormais stockés avec chaque
-# clé et renvoyés par `/verify_key` à CHAQUE connexion. Ce ne sont PAS
-# des dates d'expiration de la clé : la clé reste valable pour se
-# CONNECTER indéfiniment (jusqu'à révocation via `/revoke_key`). C'est
-# à l'application cliente de démarrer, à partir de l'instant précis de
-# CETTE connexion, une fenêtre de travail de cette durée exacte.
-#
-# ⚡ RÉTROCOMPATIBILITÉ : les anciennes clés stockées avant cette
-# évolution n'ont qu'un champ "section" (chaîne) au lieu de "sections"
-# (liste), et n'ont pas de champ "durationValue"/"durationUnit" du
-# tout. `_key_sections()` normalise les deux formats de section, et
-# `/verify_key` applique un repli sûr (30 jours) quand ces champs sont
-# absents, afin que les clés déjà distribuées continuent de fonctionner
-# sans avoir à être régénérées.
-# ====================================================================
-
 def _key_sections(info):
-    """Renvoie toujours une LISTE de sections à partir d'une entrée de
-    clé, qu'elle ait été enregistrée à l'ancien format ('section': str)
-    ou au nouveau format ('sections': list)."""
     if info.get('sections'):
         return list(info['sections'])
     single = info.get('section')
@@ -1756,17 +1420,11 @@ def _key_sections(info):
 
 
 def _slug(value, max_len=12):
-    """Réduit une chaîne à des caractères alphanumériques, en majuscules,
-    pour l'insérer proprement dans la clé texte (la section/classe peut
-    contenir des espaces, accents, etc. ex: '6ème A')."""
     cleaned = re.sub(r'[^A-Za-z0-9]', '', value or '')
     return cleaned.upper()[:max_len] if cleaned else "ALL"
 
 
 def _sections_slug(sections):
-    """Partie lisible de la clé texte représentant les sections
-    choisies : les 3 premières lettres de chacune, jointes par '+',
-    tronquée si trop de sections sont sélectionnées d'un coup."""
     if not sections:
         return "ALL"
     parts = [s.upper()[:3] for s in sections if s]
@@ -1780,25 +1438,16 @@ def generate_key():
         data        = request.get_json()
         school_code = data.get('school_code')
 
-        # ⚡⚡⚡ NOUVEAU — accepte une LISTE de sections ('sections'), tout
-        # en restant rétrocompatible avec l'ancien champ unique
-        # ('section') si jamais un ancien client l'envoie encore.
         sections_raw = data.get('sections')
         if sections_raw is None:
             single_section = data.get('section')
             sections_raw = [single_section] if single_section else []
         sections = [s.strip() for s in sections_raw if s and s.strip()]
-        # On élimine les doublons tout en gardant l'ordre de sélection
-        # choisi par l'admin (plus intuitif pour lui à la relecture).
         seen = set()
         sections = [s for s in sections if not (s in seen or seen.add(s))]
 
         key_type = (data.get('type') or 'PAY').strip().upper()
 
-        # La classe n'a de sens QUE si une seule section est ciblée :
-        # une classe appartient à une seule section. Dès que plusieurs
-        # sections sont sélectionnées, on ignore toute classe fournie
-        # et la clé donne accès à "toutes les classes" de chacune.
         classe = (data.get('classe') or '').strip()
         if len(sections) != 1:
             classe = ''
@@ -1814,11 +1463,6 @@ def generate_key():
                          f"{', '.join(sorted(KEY_TYPES))}"
             }), 400
 
-        # ⚡⚡⚡ NOUVEAU — durée de TRAVAIL autorisée après connexion,
-        # choisie par l'admin. Ce n'est PAS une expiration de la clé :
-        # la clé reste valable pour se connecter indéfiniment (voir
-        # /verify_key), seule la fenêtre de travail après connexion
-        # est limitée par ces valeurs.
         try:
             duration_value = int(data.get('duration_value', 30))
         except (TypeError, ValueError):
@@ -1836,36 +1480,20 @@ def generate_key():
         keys      = _load_json(KEYS_FILE, {})
         keys[key] = {
             "school_code": school_code,
-            # ⚡⚡⚡ NOUVEAU — la liste complète des sections accessibles
-            # avec cette clé (le sous-utilisateur pourra basculer entre
-            # elles librement une fois connecté).
             "sections":    sections,
-            # Champ conservé pour compatibilité avec un éventuel ancien
-            # code qui lirait encore 'section' (toujours la 1ère de la
-            # liste) — non utilisé par le nouveau client.
             "section":     sections[0],
             "type":        key_type,
             "classe":      classe if classe else None,
-            # ⚡⚡⚡ NOUVEAU — durée de TRAVAIL choisie par l'admin,
-            # utilisée uniquement à partir de la connexion (voir
-            # /verify_key), jamais comme expiration de la clé.
             "durationValue": duration_value,
             "durationUnit":  duration_unit,
         }
         _save_json(KEYS_FILE, keys)
-        logger.info(
-            "🔑 generate_key : école='%s' type='%s' sections=%s classe='%s' "
-            "durée_travail=%s %s → clé générée",
-            school_code, key_type, sections, classe or "TOUTES",
-            duration_value, duration_unit,
-        )
         return jsonify({
             "key":      key,
             "sections": sections,
             "section":  sections[0],
             "type":     key_type,
             "classe":   classe or None,
-            # ⚡⚡⚡ NOUVEAU — renvoyé pour affichage immédiat côté admin.
             "duration_value": duration_value,
             "duration_unit":  duration_unit,
         }), 200
@@ -1884,7 +1512,6 @@ def verify_key():
         keys = _load_json(KEYS_FILE, {})
         info = keys.get(key)
         if not info:
-            logger.warning("verify_key : clé invalide/introuvable")
             return jsonify({"valid": False, "error": "Clé invalide"}), 404
         school_code  = info["school_code"]
         sections     = _key_sections(info)
@@ -1897,38 +1524,18 @@ def verify_key():
             school_name  = saved.get('config', {}).get('schoolName', school_code)
             current_year = saved.get('currentYear')
 
-        # ⚡⚡⚡ NOUVEAU — durée de TRAVAIL autorisée après CETTE
-        # connexion, telle que définie par l'admin à la génération de la
-        # clé. Repli sur 30 jours pour les clés générées AVANT l'ajout
-        # de cette fonctionnalité (elles n'ont pas ces champs stockés).
-        # La clé elle-même reste valable pour se connecter
-        # indéfiniment : ces valeurs ne servent qu'à armer, côté
-        # client, une fenêtre de travail à partir de maintenant.
         duration_value = info.get('durationValue', 30)
         duration_unit  = info.get('durationUnit', 'days')
 
-        logger.info(
-            "verify_key : clé valide pour école='%s' type='%s' sections=%s "
-            "classe='%s' durée_travail=%s %s",
-            school_code, info.get('type', 'PAY'), sections, info.get('classe'),
-            duration_value, duration_unit,
-        )
         return jsonify({
             "valid":        True,
             "school_code":  school_code,
-            # ⚡⚡⚡ NOUVEAU — la liste complète des sections que le client
-            # peut désormais proposer dans un sélecteur/bascule.
             "sections":     sections,
-            # Conservé pour compatibilité (1ère section de la liste).
             "section":      sections[0] if sections else None,
             "type":         info.get("type", "PAY"),
-            # La classe n'est renvoyée que si la clé est verrouillée sur
-            # UNE SEULE section — sinon toujours None (toutes classes).
             "classe":       info.get("classe") if len(sections) == 1 else None,
             "school_name":  school_name,
             "current_year": current_year,
-            # ⚡⚡⚡ NOUVEAU — durée de TRAVAIL à démarrer par le client
-            # à partir de MAINTENANT (cette connexion précise).
             "duration_value": duration_value,
             "duration_unit":  duration_unit,
         }), 200
@@ -1948,7 +1555,6 @@ def revoke_key():
         if key in keys:
             del keys[key]
             _save_json(KEYS_FILE, keys)
-            logger.info("revoke_key : clé révoquée")
         return jsonify({"message": "Clé révoquée"}), 200
     except Exception as e:
         logger.exception("Erreur revoke_key")
@@ -1957,10 +1563,6 @@ def revoke_key():
 
 @app.route('/list_keys', methods=['GET'])
 def list_keys():
-    """⚡⚡⚡ Liste toutes les clés actives d'une école, pour que l'admin
-    puisse voir/gérer (et révoquer) les clés déjà distribuées, avec leur
-    type, LEURS sections (liste), classe, et désormais leur durée de
-    travail (`durationValue`/`durationUnit`)."""
     try:
         school_code = request.args.get('school_code')
         if not school_code:
@@ -1972,7 +1574,6 @@ def list_keys():
                 "type":     v.get("type", "PAY"),
                 "sections": _key_sections(v),
                 "classe":   v.get("classe"),
-                # ⚡⚡⚡ NOUVEAU
                 "durationValue": v.get("durationValue", 30),
                 "durationUnit":  v.get("durationUnit", "days"),
             }
@@ -1986,8 +1587,6 @@ def list_keys():
 
 
 def _generate_student_id_for_school(school_code, nom, year, school_name, proposed_id=None):
-    """Factorisation de la logique déjà utilisée par /generate_student_id,
-    réutilisée aussi par la validation des inscriptions en attente."""
     ids_store = _load_json(IDS_FILE, {})
     used_ids  = set(ids_store.get(school_code.lower(), []))
 
@@ -2026,16 +1625,11 @@ def generate_student_id():
 
         candidate = _generate_student_id_for_school(
             school_code, nom, year, school_name, proposed_id)
-        logger.info("generate_student_id : école='%s' → id='%s'", school_code, candidate)
         return jsonify({"id": candidate}), 200
     except Exception as e:
         logger.exception("Erreur generate_student_id")
         return jsonify({"error": str(e)}), 500
 
-
-# ====================================================================
-# ⚡⚡ INSCRIPTIONS EN ATTENTE (clé de type INSC)
-# ====================================================================
 
 @app.route('/school/submit_registration', methods=['POST'])
 def submit_registration():
@@ -2089,11 +1683,6 @@ def submit_registration():
         pending_store[school_key] = pending_list
         _save_json(PENDING_REGISTRATIONS_FILE, pending_store)
 
-        logger.info(
-            "🧑‍🎓 submit_registration : école='%s' élève='%s %s' classe='%s' → id_attente='%s'",
-            school_code, nom, prenom, classe, registration_id,
-        )
-
         return jsonify({
             "message":         "Inscription reçue, en attente de validation",
             "registration_id": registration_id,
@@ -2111,10 +1700,6 @@ def get_pending_registrations():
             return jsonify({"error": "Code manquant"}), 400
         pending_store = _load_json(PENDING_REGISTRATIONS_FILE, {})
         pending_list  = pending_store.get(school_code.lower(), [])
-        logger.info(
-            "get_pending_registrations : école='%s' → %d en attente",
-            school_code, len(pending_list),
-        )
         return jsonify({"pending_registrations": pending_list}), 200
     except Exception as e:
         logger.exception("Erreur get_pending_registrations")
@@ -2183,11 +1768,6 @@ def validate_registrations():
         pending_store[school_key] = remaining
         _save_json(PENDING_REGISTRATIONS_FILE, pending_store)
 
-        logger.info(
-            "✅ validate_registrations : école='%s' | %d validée(s) | %d restante(s)",
-            school_code, len(created_students), len(remaining),
-        )
-
         return jsonify({
             "message":          "Inscriptions validées",
             "created_students": created_students,
@@ -2213,16 +1793,11 @@ def reject_registration():
         pending_list  = [p for p in pending_list if p.get('id') != registration_id]
         pending_store[school_key] = pending_list
         _save_json(PENDING_REGISTRATIONS_FILE, pending_store)
-        logger.info("reject_registration : école='%s' id='%s' rejetée", school_code, registration_id)
         return jsonify({"message": "Inscription rejetée"}), 200
     except Exception as e:
         logger.exception("Erreur reject_registration")
         return jsonify({"error": str(e)}), 500
 
-
-# ====================================================================
-# ⚡⚡ AUTRES FRAIS (clé de type AFR)
-# ====================================================================
 
 @app.route('/school/get_autres_frais', methods=['GET'])
 def get_autres_frais():
@@ -2300,11 +1875,6 @@ def submit_autre_frais_payment():
         pending_store[school_key] = pending_list
         _save_json(PENDING_AUTRES_FRAIS_FILE, pending_store)
 
-        logger.info(
-            "💰 submit_autre_frais_payment : école='%s' élève='%s' frais='%s' montant=%s → id_attente='%s'",
-            school_code, eleve_id, frais.get('nom', ''), montant, payment_id,
-        )
-
         return jsonify({
             "message":    "Paiement reçu, en attente de validation",
             "pending_id": payment_id,
@@ -2378,11 +1948,6 @@ def validate_autres_frais_payments():
         pending_store[school_key] = remaining
         _save_json(PENDING_AUTRES_FRAIS_FILE, pending_store)
 
-        logger.info(
-            "✅ validate_autres_frais_payments : école='%s' | %d validé(s) | %d restant(s)",
-            school_code, validated_count, len(remaining),
-        )
-
         return jsonify({
             "message":           "Paiements validés",
             "validated_count":   validated_count,
@@ -2414,10 +1979,6 @@ def reject_autre_frais_payment():
         return jsonify({"error": str(e)}), 500
 
 
-# ====================================================================
-# ⚡ MODULE DISCIPLINE (clé de type DISC)
-# ====================================================================
-
 def _new_message_id():
     return f"msg_{datetime.datetime.now().strftime('%Y%m%d%H%M%S%f')}_{os.urandom(3).hex()}"
 
@@ -2428,7 +1989,7 @@ def _add_message_for_student(school_code, student_id, msg_type, title, message, 
     msg_list       = messages_store.get(school_key, [])
     entry = {
         "id":         _new_message_id(),
-        "type":       msg_type,   # 'absence' | 'convocation' | 'announcement'
+        "type":       msg_type,
         "student_id": student_id,
         "title":      title,
         "message":    message,
@@ -2501,11 +2062,6 @@ def record_absences():
             )
             sent.append(sid)
 
-        logger.info(
-            "📋 record_absences : école='%s' classe='%s' date='%s' | %d absent(s) notifié(s)",
-            school_code, classe, date_str, len(sent),
-        )
-
         return jsonify({
             "message":        "Absences enregistrées et parents notifiés",
             "notified_count": len(sent),
@@ -2548,10 +2104,6 @@ def send_convocation():
         entry = _add_message_for_student(
             school_code, student_id, "convocation", title, message)
 
-        logger.info(
-            "📨 send_convocation : école='%s' élève='%s'",
-            school_code, student_id,
-        )
         return jsonify({"message": "Convocation envoyée", "id": entry["id"]}), 200
     except Exception as e:
         logger.exception("Erreur send_convocation")
@@ -2570,9 +2122,6 @@ def send_announcement():
         student_ids = data.get('student_ids', [])
         classe      = data.get('classe', '')
         section     = data.get('section', '')
-        # ⚡⚡⚡ NOUVEAU — cible multi-sections, quand le sous-utilisateur
-        # (ou l'admin) veut viser plusieurs sections d'un coup depuis une
-        # clé qui en couvre plusieurs.
         sections    = data.get('sections') or ([section] if section else [])
 
         if not school_code or not annee or not message:
@@ -2608,10 +2157,6 @@ def send_announcement():
             )
             sent.append(sid)
 
-        logger.info(
-            "📢 send_announcement : école='%s' cible='%s' | %d parent(s) notifié(s)",
-            school_code, target, len(sent),
-        )
         return jsonify({
             "message":        "Communiqué envoyé",
             "notified_count": len(sent),
@@ -2677,8 +2222,171 @@ def parent_mark_message_read():
 
 
 # ====================================================================
-# ⚡ ROUTE DE DIAGNOSTIC
+# ROUTES PROMOTEUR — résumé après sauvegarde + demandes d'approbation
 # ====================================================================
+
+@app.route('/school/push_promoter_summary', methods=['POST'])
+def push_promoter_summary():
+    try:
+        data        = request.get_json()
+        school_code = data.get('school_code')
+        summary     = data.get('summary')
+        if not school_code or summary is None:
+            return jsonify({"error": "Données manquantes"}), 400
+        store = _load_json(PROMOTER_SUMMARY_FILE, {})
+        summary['updated_at'] = datetime.datetime.now().isoformat()
+        store[school_code.lower()] = summary
+        _save_json(PROMOTER_SUMMARY_FILE, store)
+        logger.info("push_promoter_summary : école='%s' résumé mis à jour", school_code)
+        return jsonify({"message": "Résumé mis à jour"}), 200
+    except Exception as e:
+        logger.exception("Erreur push_promoter_summary")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/school/get_promoter_summary', methods=['GET'])
+def get_promoter_summary():
+    try:
+        school_code = request.args.get('school_code')
+        if not school_code:
+            return jsonify({"error": "Code manquant"}), 400
+        store = _load_json(PROMOTER_SUMMARY_FILE, {})
+        summary = store.get(school_code.lower())
+        return jsonify({"summary": summary}), 200
+    except Exception as e:
+        logger.exception("Erreur get_promoter_summary")
+        return jsonify({"error": str(e)}), 500
+
+
+def _new_promoter_request_id():
+    return f"preq_{datetime.datetime.now().strftime('%Y%m%d%H%M%S%f')}_{os.urandom(3).hex()}"
+
+
+@app.route('/school/create_promoter_request', methods=['POST'])
+def create_promoter_request():
+    try:
+        data        = request.get_json()
+        school_code = data.get('school_code')
+        req_type    = data.get('type')
+        if not school_code or req_type not in ('reprint', 'modify', 'cancel'):
+            return jsonify({"error": "Données invalides"}), 400
+
+        request_id = _new_promoter_request_id()
+        entry = {
+            "id":              request_id,
+            "type":            req_type,
+            "eleve_id":        data.get('eleve_id', ''),
+            "eleve_nom":       data.get('eleve_nom', ''),
+            "classe":          data.get('classe', ''),
+            "section":         data.get('section', ''),
+            "mois":            data.get('mois', ''),
+            "transaction_id":  data.get('transaction_id', ''),
+            "montant_actuel":  data.get('montant_actuel'),
+            "nouveau_montant": data.get('nouveau_montant'),
+            "status":          "pending",
+            "created_at":      datetime.datetime.now().isoformat(),
+        }
+
+        school_key   = school_code.lower()
+        store        = _load_json(PROMOTER_PENDING_REQUESTS_FILE, {})
+        pending_list = store.get(school_key, [])
+        pending_list.append(entry)
+        store[school_key] = pending_list
+        _save_json(PROMOTER_PENDING_REQUESTS_FILE, store)
+
+        logger.info(
+            "📨 create_promoter_request : école='%s' type='%s' id='%s'",
+            school_code, req_type, request_id,
+        )
+        return jsonify({"request_id": request_id}), 200
+    except Exception as e:
+        logger.exception("Erreur create_promoter_request")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/school/get_promoter_requests', methods=['GET'])
+def get_promoter_requests():
+    try:
+        school_code = request.args.get('school_code')
+        if not school_code:
+            return jsonify({"error": "Code manquant"}), 400
+        store        = _load_json(PROMOTER_PENDING_REQUESTS_FILE, {})
+        pending_list = store.get(school_code.lower(), [])
+        pending_list.sort(key=lambda r: r.get('created_at', ''), reverse=True)
+        return jsonify({"requests": pending_list, "total": len(pending_list)}), 200
+    except Exception as e:
+        logger.exception("Erreur get_promoter_requests")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/school/resolve_promoter_request', methods=['POST'])
+def resolve_promoter_request():
+    try:
+        data        = request.get_json()
+        school_code = data.get('school_code')
+        request_id  = data.get('request_id')
+        action      = data.get('action')
+        if not school_code or not request_id or action not in ('approve', 'reject'):
+            return jsonify({"error": "Données invalides"}), 400
+
+        school_key    = school_code.lower()
+        pending_store = _load_json(PROMOTER_PENDING_REQUESTS_FILE, {})
+        pending_list  = pending_store.get(school_key, [])
+
+        target = next((r for r in pending_list if r.get('id') == request_id), None)
+        if target is None:
+            return jsonify({"error": "Demande introuvable"}), 404
+
+        pending_list = [r for r in pending_list if r.get('id') != request_id]
+        pending_store[school_key] = pending_list
+        _save_json(PROMOTER_PENDING_REQUESTS_FILE, pending_store)
+
+        target['status']      = 'approved' if action == 'approve' else 'rejected'
+        target['resolved_at'] = datetime.datetime.now().isoformat()
+
+        resolved_store  = _load_json(PROMOTER_RESOLVED_REQUESTS_FILE, {})
+        resolved_school = resolved_store.get(school_key, {})
+        resolved_school[request_id] = target
+        resolved_store[school_key] = resolved_school
+        _save_json(PROMOTER_RESOLVED_REQUESTS_FILE, resolved_store)
+
+        logger.info(
+            "✅ resolve_promoter_request : école='%s' id='%s' action='%s'",
+            school_code, request_id, action,
+        )
+        return jsonify({"message": "Demande résolue", "status": target['status']}), 200
+    except Exception as e:
+        logger.exception("Erreur resolve_promoter_request")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/school/get_request_status', methods=['GET'])
+def get_request_status():
+    try:
+        school_code = request.args.get('school_code')
+        request_id  = request.args.get('request_id')
+        if not school_code or not request_id:
+            return jsonify({"error": "Données manquantes"}), 400
+
+        school_key = school_code.lower()
+
+        resolved_store = _load_json(PROMOTER_RESOLVED_REQUESTS_FILE, {})
+        resolved = resolved_store.get(school_key, {}).get(request_id)
+        if resolved is not None:
+            return jsonify(resolved), 200
+
+        pending_store = _load_json(PROMOTER_PENDING_REQUESTS_FILE, {})
+        pending_list  = pending_store.get(school_key, [])
+        pending = next((r for r in pending_list if r.get('id') == request_id), None)
+        if pending is not None:
+            return jsonify(pending), 200
+
+        return jsonify({"error": "Demande introuvable"}), 404
+    except Exception as e:
+        logger.exception("Erreur get_request_status")
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/admin/health', methods=['GET'])
 def admin_health():
     try:
@@ -2704,7 +2412,6 @@ def admin_health():
             except Exception:
                 details.append({"school_code": fname, "error": "fichier corrompu"})
 
-        logger.info("admin_health : %d école(s) actuellement sur le disque", len(details))
         return jsonify({
             "server_time":     datetime.datetime.now().isoformat(),
             "data_dir":        os.path.abspath(DATA_DIR),
@@ -2717,14 +2424,6 @@ def admin_health():
         return jsonify({"error": str(e)}), 500
 
 
-# ====================================================================
-# ⚡⚡⚡ RÉPARATION AUTOMATIQUE AU DÉMARRAGE DU SERVEUR
-# ====================================================================
-# S'exécute une fois, au chargement du module (donc aussi bien avec
-# `python3 school_server.py` qu'avec gunicorn sur Render). Répare
-# immédiatement toutes les écoles orphelines déjà présentes sur le
-# disque persistant, sans attendre le prochain /backup ou la prochaine
-# consultation de /admin/list_schools.
 _sync_orphan_schools()
 
 
