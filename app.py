@@ -1,4 +1,3 @@
-
 from flask import Flask, request, jsonify, send_from_directory
 import json
 import os
@@ -2699,6 +2698,53 @@ def admin_health():
         }), 200
     except Exception as e:
         logger.exception("Erreur admin_health")
+        return jsonify({"error": str(e)}), 500
+
+
+# ====================================================================
+# ROUTES ADMIN — lister et télécharger TOUS les fichiers .json du
+# disque persistant (y compris les fichiers système), protégé par
+# ADMIN_PASSWORD. Utilisées par le script Mac de sauvegarde locale.
+# ====================================================================
+
+@app.route('/admin/list_data_files', methods=['POST'])
+def admin_list_data_files():
+    try:
+        data = request.get_json()
+        if data.get('admin_password') != ADMIN_PASSWORD:
+            return jsonify({"error": "Accès refusé"}), 401
+        files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith('.json'))
+        return jsonify({"files": files, "total": len(files)}), 200
+    except Exception as e:
+        logger.exception("Erreur admin_list_data_files")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/admin/download_data_file', methods=['POST'])
+def admin_download_data_file():
+    try:
+        data = request.get_json()
+        if data.get('admin_password') != ADMIN_PASSWORD:
+            return jsonify({"error": "Accès refusé"}), 401
+
+        filename = data.get('filename', '')
+        # Protection contre le path traversal : on ne garde que le nom
+        # de fichier, sans dossier, et on vérifie qu'il correspond
+        # exactement à ce qui a été demandé.
+        safe_name = os.path.basename(filename)
+        if not safe_name.endswith('.json') or safe_name != filename:
+            return jsonify({"error": "Nom de fichier invalide"}), 400
+
+        filepath = os.path.join(DATA_DIR, safe_name)
+        if not os.path.exists(filepath):
+            return jsonify({"error": "Fichier introuvable"}), 404
+
+        with open(filepath, 'r', encoding='utf-8') as f:
+            content = json.load(f)
+
+        return jsonify({"filename": safe_name, "content": content}), 200
+    except Exception as e:
+        logger.exception("Erreur admin_download_data_file")
         return jsonify({"error": str(e)}), 500
 
 
