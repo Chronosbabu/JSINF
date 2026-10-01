@@ -7,6 +7,7 @@ import secrets
 import string
 import logging
 import sys
+import hashlib
 import firebase_admin
 from firebase_admin import credentials, messaging
 
@@ -121,6 +122,119 @@ def _save_json(path, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
+# ====================================================================
+# ⚡ NOUVEAU — ANTI-DOUBLONS DE TRANSACTIONS
+# ====================================================================
+# Cause du bug "le montant se multiplie à chaque clic sur Récupérer" :
+# l'application fusionne les transactions locales et celles du serveur.
+# Les transactions SANS 'id' ne peuvent jamais être reconnues comme
+# doublons côté application, donc elles s'ajoutaient à chaque
+# récupération. Solution côté serveur : toute transaction sans 'id'
+# reçoit un id STABLE (déterministe : toujours le même pour la même
+# transaction du même élève), et les doublons exacts sont supprimés.
+# ====================================================================
+
+def _tx_signature(t):
+    try:
+        amount = float(t.get('amount', 0) or 0)
+    except (TypeError, ValueError):
+        amount = 0.0
+    return f"{t.get('date', '')}|{t.get('mois', '')}|{amount:.2f}"
+
+
+def _stable_legacy_tx_id(eleve_id, signature):
+    raw = f"{eleve_id}|{signature}".encode('utf-8')
+    return "LEG_" + hashlib.sha1(raw).hexdigest()[:16]
+
+
+def _normalize_eleve_transactions(eleve):
+    """Dédoublonne les transactions d'un élève et donne un id stable à
+    celles qui n'en ont pas. Si des doublons ont été supprimés, 'paid'
+    est reconstruit à partir des transactions restantes.
+    Retourne le nombre de doublons supprimés."""
+    txs = eleve.get('transactions')
+    if not isinstance(txs, list) or not txs:
+        return 0
+
+    eleve_id = str(eleve.get('id', ''))
+    seen_ids = set()
+    leg_sigs = set()
+    result = []
+    removed = 0
+    modified = False
+
+    for t in txs:
+        if not isinstance(t, dict):
+            result.append(t)
+            continue
+        tid = str(t.get('id') or '').strip()
+        if tid:
+            if tid in seen_ids:
+                removed += 1
+                continue
+            seen_ids.add(tid)
+            if tid.startswith('LEG_'):
+                leg_sigs.add(_tx_signature(t))
+            result.append(t)
+        else:
+            sig = _tx_signature(t)
+            if sig in leg_sigs:
+                removed += 1
+                continue
+            new_id = _stable_legacy_tx_id(eleve_id, sig)
+            if new_id in seen_ids:
+                removed += 1
+                continue
+            t['id'] = new_id
+            seen_ids.add(new_id)
+            leg_sigs.add(sig)
+            modified = True
+            result.append(t)
+
+    if removed > 0 or modified:
+        eleve['transactions'] = result
+
+    if removed > 0:
+        paid = {}
+        for t in result:
+            if not isinstance(t, dict):
+                continue
+            mois = str(t.get('mois', '') or '')
+            if not mois:
+                continue
+            try:
+                amount = float(t.get('amount', 0) or 0)
+            except (TypeError, ValueError):
+                amount = 0.0
+            paid[mois] = paid.get(mois, 0) + amount
+        eleve['paid'] = paid
+
+    return removed
+
+
+def _normalize_school_data(data):
+    """Applique la normalisation à tous les élèves (années + archive des
+    élèves supprimés). Retourne le total de doublons supprimés."""
+    total_removed = 0
+    if not isinstance(data, dict):
+        return 0
+
+    for yd in (data.get('history') or {}).values():
+        if not isinstance(yd, dict):
+            continue
+        for e in yd.get('eleves', []) or []:
+            if isinstance(e, dict):
+                total_removed += _normalize_eleve_transactions(e)
+
+    archive = data.get('elevesSupprimesData')
+    if isinstance(archive, dict):
+        for e in archive.get('eleves', []) or []:
+            if isinstance(e, dict):
+                total_removed += _normalize_eleve_transactions(e)
+
+    return total_removed
+
+
 def _fcm_tokens_key(school_code):
     return school_code.strip().lower()
 
@@ -137,8 +251,6 @@ def register_fcm_token(school_code, role, token, platform):
 
     now_iso = datetime.datetime.now().isoformat()
 
-    # Retire toute entrée existante avec le même token (pour la remettre à
-    # jour proprement, y compris si son rôle ou sa plateforme a changé).
     tokens_list = [t for t in tokens_list if t.get('token') != token]
 
     tokens_list.append({
@@ -199,7 +311,6 @@ def send_fcm_to_tokens(tokens, title, body, data=None):
     data_payload = {k: str(v) for k, v in (data or {}).items()}
     invalid_tokens = []
 
-    # L'API Admin SDK limite send_each_for_multicast à 500 tokens par appel.
     batch_size = 500
     for i in range(0, len(tokens), batch_size):
         batch = tokens[i:i + batch_size]
@@ -834,6 +945,14 @@ def backup():
         if not school_code or not backup_data:
             return jsonify({"error": "Données invalides"}), 400
 
+        # ⚡ NOUVEAU — nettoyage des doublons de transactions avant stockage
+        removed = _normalize_school_data(backup_data)
+        if removed:
+            logger.warning(
+                "🧹 backup : école='%s' → %d transaction(s) en double "
+                "supprimée(s) avant enregistrement.", school_code, removed,
+            )
+
         corrected_data, corrections = _resolve_id_conflicts(
             school_code, backup_data)
 
@@ -868,11 +987,55 @@ def restore():
     if os.path.exists(filepath):
         with open(filepath, 'r', encoding='utf-8') as f:
             data = json.load(f)
+
+        # ⚡ NOUVEAU — on s'assure que toutes les transactions ont un id
+        # stable et qu'il n'y a aucun doublon : la récupération devient
+        # idempotente (cliquer 10 fois = même résultat que 1 fois).
+        removed = _normalize_school_data(data)
+        try:
+            _save_json(filepath, data)
+        except Exception:
+            logger.exception("restore : impossible de réécrire le fichier nettoyé")
+        if removed:
+            logger.warning(
+                "🧹 restore : école='%s' → %d doublon(s) supprimé(s).",
+                school_code, removed,
+            )
+
         data.pop('backup_password', None)
         _, school_entry = _find_school_entry(school_code)
         data['subscription'] = _compute_subscription_status(school_entry)
         return jsonify(data), 200
     return jsonify({"error": "Aucune sauvegarde trouvée"}), 404
+
+
+@app.route('/admin/clean_duplicate_transactions', methods=['POST'])
+def admin_clean_duplicate_transactions():
+    """À appeler UNE FOIS pour réparer toutes les écoles déjà corrompues
+    (montants multipliés). Body JSON : {"admin_password": "..."}"""
+    try:
+        data = request.get_json()
+        if data.get('admin_password') != ADMIN_PASSWORD:
+            return jsonify({"error": "Accès refusé"}), 401
+
+        report = []
+        for fname in sorted(os.listdir(DATA_DIR)):
+            if not fname.endswith('.json') or fname in SYSTEM_FILES:
+                continue
+            fpath = os.path.join(DATA_DIR, fname)
+            try:
+                with open(fpath, 'r', encoding='utf-8') as f:
+                    school_data = json.load(f)
+                removed = _normalize_school_data(school_data)
+                _save_json(fpath, school_data)
+                report.append({"fichier": fname, "doublons_supprimes": removed})
+            except Exception as e:
+                report.append({"fichier": fname, "erreur": str(e)})
+
+        return jsonify({"rapport": report, "total_fichiers": len(report)}), 200
+    except Exception as e:
+        logger.exception("Erreur admin_clean_duplicate_transactions")
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route('/record_payment', methods=['POST'])
@@ -995,7 +1158,9 @@ def validate_payments():
             eleve['paid'][entry['mois']] = (
                 eleve['paid'].get(entry['mois'], 0) + entry['amount'])
             eleve.setdefault('transactions', [])
+            # ⚡ NOUVEAU — id stable pour éviter tout doublon côté application
             eleve['transactions'].append({
+                'id':           f"SRV_{entry.get('id')}",
                 'date':         entry.get('date'),
                 'mois':         entry['mois'],
                 'amount':       entry['amount'],
@@ -1361,7 +1526,9 @@ def confirm_mobile_payments():
             eleve['paid'][entry['mois']] = (
                 eleve['paid'].get(entry['mois'], 0) + entry['amount'])
             eleve.setdefault('transactions', [])
+            # ⚡ NOUVEAU — id stable pour éviter tout doublon côté application
             eleve['transactions'].append({
+                'id':          f"SRV_{entry.get('id')}",
                 'date':        entry.get('date'),
                 'mois':        entry['mois'],
                 'amount':      entry['amount'],
@@ -1398,7 +1565,8 @@ def webhook_airtel():
         _auto_confirm_payment(
             parts[0], parts[1],
             float(data.get('transaction', {}).get('amount', 0)),
-            'airtel'
+            'airtel',
+            ref,
         )
     return jsonify({"ok": True}), 200
 
@@ -1413,7 +1581,7 @@ def webhook_vodacom():
     return jsonify({"ok": True}), 200
 
 
-def _auto_confirm_payment(eleve_id, mois, amount, network):
+def _auto_confirm_payment(eleve_id, mois, amount, network, tx_ref=''):
     for fname in os.listdir(DATA_DIR):
         if not fname.endswith('.json') or fname in SYSTEM_FILES:
             continue
@@ -1430,10 +1598,18 @@ def _auto_confirm_payment(eleve_id, mois, amount, network):
         for e in year_data.get('eleves', []):
             if e.get('id', '').upper() != eleve_id.upper():
                 continue
+
+            # ⚡ NOUVEAU — id stable + protection contre un webhook rejoué
+            tx_id = (f"SRV_AUTO_{tx_ref}" if tx_ref
+                     else f"SRV_AUTO_{os.urandom(6).hex()}")
+            e.setdefault('transactions', [])
+            if any(t.get('id') == tx_id for t in e['transactions']):
+                return
+
             e.setdefault('paid', {})
             e['paid'][mois] = e['paid'].get(mois, 0) + amount
-            e.setdefault('transactions', [])
             e['transactions'].append({
+                'id':          tx_id,
                 'date':        datetime.date.today().isoformat(),
                 'mois':        mois,
                 'amount':      amount,
@@ -2116,6 +2292,10 @@ def validate_autres_frais_payments():
         for entry in to_validate:
             annee = entry.get('annee')
             saved['autresFraisPaiementsByYear'].setdefault(annee, [])
+            # ⚡ NOUVEAU — on évite d'ajouter deux fois le même paiement (même id)
+            if any(p.get('id') == entry.get('id')
+                   for p in saved['autresFraisPaiementsByYear'][annee]):
+                continue
             saved['autresFraisPaiementsByYear'][annee].append({
                 "id":            entry.get('id'),
                 "autreFraisId":  entry.get('autreFraisId'),
@@ -2728,9 +2908,6 @@ def admin_download_data_file():
             return jsonify({"error": "Accès refusé"}), 401
 
         filename = data.get('filename', '')
-        # Protection contre le path traversal : on ne garde que le nom
-        # de fichier, sans dossier, et on vérifie qu'il correspond
-        # exactement à ce qui a été demandé.
         safe_name = os.path.basename(filename)
         if not safe_name.endswith('.json') or safe_name != filename:
             return jsonify({"error": "Nom de fichier invalide"}), 400
