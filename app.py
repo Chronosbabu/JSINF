@@ -147,10 +147,22 @@ def _stable_legacy_tx_id(eleve_id, signature):
     return "LEG_" + hashlib.sha1(raw).hexdigest()[:16]
 
 
-def _normalize_eleve_transactions(eleve):
+def _tx_amount(t):
+    try:
+        return float(t.get('amount', 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _normalize_eleve_transactions(eleve, rebuild_paid=False):
     """Dédoublonne les transactions d'un élève et donne un id stable à
-    celles qui n'en ont pas. Si des doublons ont été supprimés, 'paid'
-    est reconstruit à partir des transactions restantes.
+    celles qui n'en ont pas.
+
+    ⚡ CORRECTION : quand des doublons sont supprimés, on RETIRE seulement
+    leur montant de 'paid' (au lieu de reconstruire 'paid' depuis les
+    transactions, ce qui effaçait les anciens paiements sans transaction et
+    faisait baisser les totaux). La reconstruction complète n'est faite que
+    si rebuild_paid=True (route admin de réparation).
     Retourne le nombre de doublons supprimés."""
     txs = eleve.get('transactions')
     if not isinstance(txs, list) or not txs:
@@ -162,6 +174,12 @@ def _normalize_eleve_transactions(eleve):
     result = []
     removed = 0
     modified = False
+    removed_by_mois = {}
+
+    def _note_removed(tx):
+        m = str(tx.get('mois', '') or '')
+        if m:
+            removed_by_mois[m] = removed_by_mois.get(m, 0.0) + _tx_amount(tx)
 
     for t in txs:
         if not isinstance(t, dict):
@@ -171,6 +189,7 @@ def _normalize_eleve_transactions(eleve):
         if tid:
             if tid in seen_ids:
                 removed += 1
+                _note_removed(t)
                 continue
             seen_ids.add(tid)
             if tid.startswith('LEG_'):
@@ -180,10 +199,12 @@ def _normalize_eleve_transactions(eleve):
             sig = _tx_signature(t)
             if sig in leg_sigs:
                 removed += 1
+                _note_removed(t)
                 continue
             new_id = _stable_legacy_tx_id(eleve_id, sig)
             if new_id in seen_ids:
                 removed += 1
+                _note_removed(t)
                 continue
             t['id'] = new_id
             seen_ids.add(new_id)
@@ -195,24 +216,30 @@ def _normalize_eleve_transactions(eleve):
         eleve['transactions'] = result
 
     if removed > 0:
-        paid = {}
-        for t in result:
-            if not isinstance(t, dict):
-                continue
-            mois = str(t.get('mois', '') or '')
-            if not mois:
-                continue
-            try:
-                amount = float(t.get('amount', 0) or 0)
-            except (TypeError, ValueError):
-                amount = 0.0
-            paid[mois] = paid.get(mois, 0) + amount
-        eleve['paid'] = paid
+        if rebuild_paid:
+            paid = {}
+            for t in result:
+                if not isinstance(t, dict):
+                    continue
+                mois = str(t.get('mois', '') or '')
+                if not mois:
+                    continue
+                paid[mois] = paid.get(mois, 0) + _tx_amount(t)
+            eleve['paid'] = paid
+        else:
+            paid = eleve.get('paid')
+            if isinstance(paid, dict):
+                for mois, amt in removed_by_mois.items():
+                    if mois in paid:
+                        try:
+                            paid[mois] = max(0.0, float(paid[mois] or 0) - amt)
+                        except (TypeError, ValueError):
+                            pass
 
     return removed
 
 
-def _normalize_school_data(data):
+def _normalize_school_data(data, rebuild_paid=False):
     """Applique la normalisation à tous les élèves (années + archive des
     élèves supprimés). Retourne le total de doublons supprimés."""
     total_removed = 0
@@ -224,15 +251,42 @@ def _normalize_school_data(data):
             continue
         for e in yd.get('eleves', []) or []:
             if isinstance(e, dict):
-                total_removed += _normalize_eleve_transactions(e)
+                total_removed += _normalize_eleve_transactions(e, rebuild_paid)
 
     archive = data.get('elevesSupprimesData')
     if isinstance(archive, dict):
         for e in archive.get('eleves', []) or []:
             if isinstance(e, dict):
-                total_removed += _normalize_eleve_transactions(e)
+                total_removed += _normalize_eleve_transactions(e, rebuild_paid)
 
     return total_removed
+
+
+def _store_promoter_summary(school_code, summary, notify=True):
+    """Enregistre le résumé du promoteur en REMPLAÇANT entièrement l'ancien
+    (aucune fusion : ce que le PC envoie est exactement ce que le promoteur
+    voit). Utilisé par /backup et /school/push_promoter_summary."""
+    store = _load_json(PROMOTER_SUMMARY_FILE, {})
+    summary['updated_at'] = datetime.datetime.now().isoformat()
+    store[school_code.lower()] = summary
+    _save_json(PROMOTER_SUMMARY_FILE, store)
+    logger.info("promoter_summary : école='%s' résumé remplacé", school_code)
+
+    if notify:
+        try:
+            money_today = summary.get('moneyToday')
+            body = "Le tableau de bord vient d'être mis à jour."
+            if isinstance(money_today, (int, float)):
+                body = (f"Argent aujourd'hui : {money_today:,.0f} FC — "
+                        f"données mises à jour.").replace(',', ' ')
+            notify_school_role(
+                school_code, "promoteur",
+                "Nouvelles données disponibles",
+                body,
+                data={"type": "summary_update", "school_code": school_code},
+            )
+        except Exception:
+            logger.exception("Notification résumé : échec (non bloquant)")
 
 
 def _fcm_tokens_key(school_code):
@@ -966,12 +1020,25 @@ def backup():
                 school_code,
             )
 
+        # ⚡ NOUVEAU — le résumé promoteur arrive avec la sauvegarde et est
+        # enregistré dans la même requête (plus de 2ᵉ appel qui échoue en
+        # silence et laisse le promoteur sur d'anciennes données).
+        summary_saved = False
+        promoter_summary = data.get('promoter_summary')
+        if isinstance(promoter_summary, dict):
+            try:
+                _store_promoter_summary(school_code, promoter_summary)
+                summary_saved = True
+            except Exception:
+                logger.exception("backup : résumé promoteur non enregistré")
+
         _, school_entry = _find_school_entry(school_code)
         return jsonify({
-            "message":      "Sauvegarde réussie",
-            "school_code":  school_code,
-            "corrections":  corrections,
-            "subscription": _compute_subscription_status(school_entry),
+            "message":       "Sauvegarde réussie",
+            "school_code":   school_code,
+            "corrections":   corrections,
+            "summary_saved": summary_saved,
+            "subscription":  _compute_subscription_status(school_entry),
         }), 200
     except Exception as e:
         logger.exception("❌ Erreur lors du BACKUP")
@@ -1026,7 +1093,7 @@ def admin_clean_duplicate_transactions():
             try:
                 with open(fpath, 'r', encoding='utf-8') as f:
                     school_data = json.load(f)
-                removed = _normalize_school_data(school_data)
+                removed = _normalize_school_data(school_data, rebuild_paid=True)
                 _save_json(fpath, school_data)
                 report.append({"fichier": fname, "doublons_supprimes": removed})
             except Exception as e:
@@ -2645,22 +2712,7 @@ def push_promoter_summary():
         summary     = data.get('summary')
         if not school_code or summary is None:
             return jsonify({"error": "Données manquantes"}), 400
-        store = _load_json(PROMOTER_SUMMARY_FILE, {})
-        summary['updated_at'] = datetime.datetime.now().isoformat()
-        store[school_code.lower()] = summary
-        _save_json(PROMOTER_SUMMARY_FILE, store)
-        logger.info("push_promoter_summary : école='%s' résumé mis à jour", school_code)
-
-        money_today = summary.get('moneyToday')
-        body = "Le tableau de bord vient d'être mis à jour."
-        if isinstance(money_today, (int, float)):
-            body = f"Argent aujourd'hui : {money_today:,.0f} FC — données mises à jour.".replace(',', ' ')
-        notify_school_role(
-            school_code, "promoteur",
-            "Nouvelles données disponibles",
-            body,
-            data={"type": "summary_update", "school_code": school_code},
-        )
+        _store_promoter_summary(school_code, summary)
 
         return jsonify({"message": "Résumé mis à jour"}), 200
     except Exception as e:
