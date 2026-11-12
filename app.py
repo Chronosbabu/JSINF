@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify, send_from_directory
 import json
 import os
 import re
+import time
 import datetime
 import secrets
 import string
@@ -753,6 +754,12 @@ def _log_incoming_request():
         "→ %s %s | IP=%s",
         request.method, request.path, request.remote_addr,
     )
+    # ⚡ NOUVEAU — garantit que le robot des rappels urgents tourne dans
+    # CE processus (utile si gunicorn utilise --preload ou plusieurs workers).
+    try:
+        _ensure_reminder_worker()
+    except Exception:
+        logger.exception("Robot de rappels : démarrage impossible (non bloquant)")
 
 
 _WEB_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -2429,6 +2436,12 @@ def reject_autre_frais_payment():
 #   sender = 'parent' → message envoyé PAR le parent à l'école
 #   read   = le DESTINATAIRE a lu le message
 #            (école→parent : le parent l'a lu ; parent→école : l'école l'a lu)
+#   read_at       = moment de la lecture
+#   delivered_at  = moment où le téléphone du parent a téléchargé le message
+#   urgent        = message URGENT : rappels vibrants automatiques tant
+#                   que le parent ne l'a pas lu
+#   batch_id      = identifiant d'un envoi groupé (un communiqué envoyé à
+#                   30 élèves = 30 messages, 1 seul batch_id)
 # Les anciens messages (sans 'sender'/'seq') restent valides : ils sont
 # considérés comme venant de l'école et reçoivent un seq au démarrage.
 # ====================================================================
@@ -2436,7 +2449,15 @@ def reject_autre_frais_payment():
 MAX_MESSAGE_LENGTH      = 2000
 PARENT_RATE_LIMIT       = 20          # messages max / minute / élève
 PARENT_PUSH_CHANNEL_ID  = "edupay_parent_messages"
+# Doit être IDENTIQUE à kUrgentChannelId dans notification_service.dart
+PARENT_URGENT_PUSH_CHANNEL_ID = "edupay_parent_urgent"
 MAX_CHILDREN_PER_DEVICE = 30
+
+# Rappels d'un message urgent non lu : délais (en minutes) entre l'envoi
+# et chaque rappel. Après le dernier, le robot s'arrête.
+#   envoi → +2 min → +5 min → +10 min → +15 min → +30 min → +60 min
+URGENT_REMINDER_DELAYS_MIN = [2, 5, 10, 15, 30, 60]
+URGENT_WORKER_INTERVAL_SEC = 30       # fréquence de vérification du robot
 
 _MSG_THREAD_LOCK = threading.RLock()
 _MSG_LOCK_FILE   = os.path.join(DATA_DIR, "parent_messages.lock")
@@ -2474,6 +2495,25 @@ def _save_json_atomic(path, data):
 
 def _utc_now_iso():
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def _parse_iso(s):
+    """Date ISO → datetime avec fuseau (UTC si absent). None si illisible."""
+    if not s:
+        return None
+    try:
+        d = datetime.datetime.fromisoformat(str(s))
+    except Exception:
+        return None
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=datetime.timezone.utc)
+    return d
+
+
+def _as_bool(v):
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in ('1', 'true', 'yes', 'oui')
 
 
 def _sender_of(m):
@@ -2544,19 +2584,34 @@ def _school_students_map(school_code):
     return out
 
 
+def _student_label(students, m):
+    """Nom complet affichable d'un élève à partir d'un message."""
+    sid = (m.get('student_id') or '').upper()
+    stu = students.get(sid, {})
+    name = f"{stu.get('nom','')} {stu.get('postNom','')} {stu.get('prenom','')}".strip()
+    return name or m.get('nom_eleve') or sid
+
+
+def _new_batch_id():
+    return f"bat_{datetime.datetime.now().strftime('%Y%m%d%H%M%S%f')}_{os.urandom(3).hex()}"
+
+
 def _add_messages_bulk(school_code, items):
     """Ajoute plusieurs messages en UNE seule lecture/écriture du fichier.
     items = liste de dict(student_id, type, title, message, sender, extra,
-    client_id). Retourne la liste de (entry, created_bool).
-    Idempotent : un même (student_id, client_id) n'est jamais dupliqué."""
+    client_id, urgent). Retourne la liste de (entry, created_bool).
+    Idempotent : un même (student_id, client_id) n'est jamais dupliqué.
+    Tous les messages d'un même appel partagent le même `batch_id`."""
     school_key = school_code.strip().lower()
     results = []
     with _messages_lock():
         store    = _load_json(MESSAGES_FILE, {})
         msg_list = store.get(school_key, [])
         seq      = max((m.get('seq') or 0 for m in msg_list), default=0)
-        now_iso  = _utc_now_iso()
+        now_dt   = datetime.datetime.now(datetime.timezone.utc)
+        now_iso  = now_dt.isoformat()
         today    = datetime.date.today().isoformat()
+        batch_id = _new_batch_id()
         known    = {}
         for m in msg_list:
             if m.get('client_id'):
@@ -2569,18 +2624,30 @@ def _add_messages_bulk(school_code, items):
                 results.append((known[(sid, cid)], False))
                 continue
             seq += 1
+            sender = it.get('sender') or 'school'
             entry = {
                 "id":         _new_message_id(),
                 "seq":        seq,
+                "batch_id":   batch_id,
                 "type":       it.get('type') or 'message',
                 "student_id": sid,
                 "title":      it.get('title') or '',
                 "message":    it.get('message') or '',
-                "sender":     it.get('sender') or 'school',
+                "sender":     sender,
                 "date":       today,
                 "created_at": now_iso,
                 "read":       False,
             }
+            # ⚡ Message URGENT (école → parent uniquement) : le robot de
+            # rappels renverra des notifications vibrantes tant qu'il n'est
+            # pas lu.
+            if it.get('urgent') and sender == 'school':
+                entry["urgent"] = True
+                entry["reminder_count"] = 0
+                entry["next_reminder_at"] = (
+                    now_dt + datetime.timedelta(
+                        minutes=URGENT_REMINDER_DELAYS_MIN[0])
+                ).isoformat()
             if cid:
                 entry["client_id"] = cid
                 known[(sid, cid)] = entry
@@ -2598,11 +2665,13 @@ def _new_message_id():
     return f"msg_{datetime.datetime.now().strftime('%Y%m%d%H%M%S%f')}_{os.urandom(3).hex()}"
 
 
-def _add_message_for_student(school_code, student_id, msg_type, title, message, extra=None):
+def _add_message_for_student(school_code, student_id, msg_type, title, message,
+                             extra=None, urgent=False):
     """Compatibilité avec l'ancien code : message ÉCOLE → parent."""
     res = _add_messages_bulk(school_code, [{
         "student_id": student_id, "type": msg_type, "title": title,
         "message": message, "sender": "school", "extra": extra,
+        "urgent": urgent,
     }])
     return res[0][0]
 
@@ -2610,6 +2679,9 @@ def _add_message_for_student(school_code, student_id, msg_type, title, message, 
 def _public_message(m):
     out = dict(m)
     out['sender'] = _sender_of(m)
+    # champs internes du robot de rappels : inutiles pour les applications
+    out.pop('next_reminder_at', None)
+    out.pop('reminders_stopped', None)
     return out
 
 
@@ -2620,6 +2692,12 @@ def _student_messages(msg_list, student_id):
 
 def _unread_for_parent(msgs):
     return sum(1 for m in msgs if _sender_of(m) != 'parent' and not m.get('read'))
+
+
+def _urgent_unread_for_parent(msgs):
+    return sum(1 for m in msgs
+               if _sender_of(m) != 'parent' and not m.get('read')
+               and m.get('urgent'))
 
 
 def _unread_for_school(msgs):
@@ -2648,6 +2726,31 @@ def _int_arg(name, default=0, lo=0, hi=1000000000):
     return max(lo, min(hi, v))
 
 
+def _mark_delivered(school_code, student_id, seqs):
+    """Note que le téléphone du parent a bien REÇU ces messages de l'école
+    (état « reçu » côté école, avant « lu »)."""
+    if not seqs:
+        return
+    school_key = school_code.strip().lower()
+    sid = student_id.strip().upper()
+    wanted = set(seqs)
+    with _messages_lock():
+        store    = _load_json(MESSAGES_FILE, {})
+        msg_list = store.get(school_key, [])
+        now_iso  = _utc_now_iso()
+        changed  = False
+        for m in msg_list:
+            if ((m.get('student_id') or '').upper() == sid
+                    and (m.get('seq') or 0) in wanted
+                    and _sender_of(m) != 'parent'
+                    and not m.get('delivered_at')):
+                m['delivered_at'] = now_iso
+                changed = True
+        if changed:
+            store[school_key] = msg_list
+            _save_json_atomic(MESSAGES_FILE, store)
+
+
 # --------------------------------------------------------------------
 # APPAREILS DES PARENTS (token FCM ⇄ élèves suivis)
 # --------------------------------------------------------------------
@@ -2663,6 +2766,22 @@ def _clean_children(raw):
             seen.add((sc, sid))
             clean.append({"school_code": sc, "student_id": sid})
     return clean
+
+
+def _devices_count_by_student(school_code):
+    """{ID_ELEVE: nombre de téléphones de parents enregistrés pour lui}.
+    Permet à l'école de savoir si un parent peut recevoir des notifications."""
+    school_key = school_code.strip().lower()
+    counts = {}
+    devices = _load_json(PARENT_DEVICES_FILE, {})
+    for dev in devices.values():
+        for c in dev.get('children', []):
+            if (c.get('school_code') or '').lower() != school_key:
+                continue
+            sid = (c.get('student_id') or '').upper()
+            if sid:
+                counts[sid] = counts.get(sid, 0) + 1
+    return counts
 
 
 @app.route('/parent/register_device', methods=['POST'])
@@ -2741,17 +2860,26 @@ def _is_dead_token_error(exc):
     return 'UNREGISTERED' in s or 'registration-token-not-registered' in s
 
 
-def notify_parents_of_messages(school_code, entries):
+def notify_parents_of_messages(school_code, entries, reminder=False):
     """Envoie une notification push aux téléphones des parents concernés.
     `entries` = messages (sender='school') qui viennent d'être créés.
     Un téléphone qui suit plusieurs élèves visés reçoit UNE seule
-    notification. Le badge iOS = total des non-lus de ses enfants."""
+    notification. Le badge iOS = total des non-lus de ses enfants.
+
+    ⚡ Si un message est URGENT (ou si c'est un RAPPEL d'urgent non lu),
+    la notification part sur le canal Android « urgent » (importance
+    maximale, vibration longue) et porte `urgent=1` pour que l'application
+    l'affiche aussi en vibrant quand elle est ouverte."""
     if not entries or not _firebase_ready():
         return
     school_key = school_code.strip().lower()
     by_student = {}
     for e in entries:
-        by_student[(e.get('student_id') or '').upper()] = e
+        sid = (e.get('student_id') or '').upper()
+        cur = by_student.get(sid)
+        # on garde de préférence le message urgent, sinon le plus récent
+        if cur is None or bool(e.get('urgent')) >= bool(cur.get('urgent')):
+            by_student[sid] = e
 
     devices = _load_json(PARENT_DEVICES_FILE, {})
     if not devices:
@@ -2779,13 +2907,26 @@ def notify_parents_of_messages(school_code, entries):
         if not matched:
             continue
 
+        urgent_any = reminder or any(
+            by_student[s].get('urgent') for s in matched)
+
         ref = by_student[matched[0]]
         if len(matched) == 1:
-            title = ref.get('title') or "Nouveau message de l'école"
+            if reminder:
+                title = "🚨 Rappel : message urgent non lu"
+            elif urgent_any:
+                title = "🚨 URGENT — " + (ref.get('title') or "Message de l'école")
+            else:
+                title = ref.get('title') or "Nouveau message de l'école"
             body  = f"{first_name(matched[0])} : {_preview(ref.get('message'), 110)}"
             tag   = matched[0]
         else:
-            title = f"{len(matched)} nouveaux messages de l'école"
+            if reminder:
+                title = f"🚨 Rappel : {len(matched)} messages urgents non lus"
+            elif urgent_any:
+                title = f"🚨 {len(matched)} messages de l'école dont un URGENT"
+            else:
+                title = f"{len(matched)} nouveaux messages de l'école"
             body  = "Pour " + ", ".join(first_name(s) for s in matched[:4])
             if len(matched) > 4:
                 body += "…"
@@ -2800,6 +2941,8 @@ def notify_parents_of_messages(school_code, entries):
             "student_id":  matched[0],
             "message_id":  str(ref.get('id', '')),
             "msg_type":    str(ref.get('type', '')),
+            "urgent":      "1" if urgent_any else "0",
+            "reminder":    "1" if reminder else "0",
         }
         outgoing.append(messaging.Message(
             token=token,
@@ -2809,9 +2952,11 @@ def notify_parents_of_messages(school_code, entries):
                 priority='high',
                 ttl=datetime.timedelta(days=3),
                 notification=messaging.AndroidNotification(
-                    channel_id=PARENT_PUSH_CHANNEL_ID,
+                    channel_id=(PARENT_URGENT_PUSH_CHANNEL_ID if urgent_any
+                                else PARENT_PUSH_CHANNEL_ID),
                     sound='default',
                     tag=tag,
+                    priority='max' if urgent_any else 'high',
                 ),
             ),
             apns=messaging.APNSConfig(
@@ -2841,8 +2986,8 @@ def notify_parents_of_messages(school_code, entries):
             else:
                 logger.warning("⚠️ Échec push parent (token conservé) : %s", r.exception)
     _remove_invalid_parent_tokens(dead)
-    logger.info("🔔 Push parents : %d envoyé(s), %d token(s) mort(s)",
-                len(outgoing), len(dead))
+    logger.info("🔔 Push parents : %d envoyé(s), %d token(s) mort(s)%s",
+                len(outgoing), len(dead), " [RAPPEL URGENT]" if reminder else "")
 
 
 def _notify_school_of_parent_message(school_code, entry, student_label):
@@ -2861,9 +3006,108 @@ def _notify_school_of_parent_message(school_code, entry, student_label):
 
 
 # --------------------------------------------------------------------
+# ⚡ ROBOT DES RAPPELS URGENTS
+# Toutes les 30 s il cherche les messages URGENTS que le parent n'a pas
+# encore lus et dont le rappel est dû. Le « marquage » du rappel se fait
+# sous verrou inter-processus AVANT l'envoi : même avec plusieurs workers
+# gunicorn, un rappel n'est jamais envoyé deux fois.
+# --------------------------------------------------------------------
+
+_reminder_state = {"pid": None}
+_reminder_start_lock = threading.Lock()
+
+
+def _claim_due_reminders():
+    """Retourne {school_key: [messages dont le rappel est dû]} et avance
+    leur compteur / prochaine échéance."""
+    claimed = {}
+    if not _firebase_ready():
+        return claimed
+    now_dt  = datetime.datetime.now(datetime.timezone.utc)
+    now_iso = now_dt.isoformat()
+    delays  = URGENT_REMINDER_DELAYS_MIN
+    with _messages_lock():
+        store   = _load_json(MESSAGES_FILE, {})
+        changed = False
+        for school_key, lst in store.items():
+            for m in lst:
+                if (not m.get('urgent') or m.get('read')
+                        or _sender_of(m) == 'parent'
+                        or m.get('reminders_stopped')):
+                    continue
+                count = m.get('reminder_count') or 0
+                if count >= len(delays):
+                    continue
+                due = _parse_iso(m.get('next_reminder_at'))
+                if due is None:
+                    # message urgent sans échéance : on la planifie
+                    created = _parse_iso(m.get('created_at')) or now_dt
+                    m['next_reminder_at'] = (
+                        created + datetime.timedelta(minutes=delays[count])
+                    ).isoformat()
+                    changed = True
+                    continue
+                if due > now_dt:
+                    continue
+                count += 1
+                m['reminder_count']   = count
+                m['last_reminder_at'] = now_iso
+                if count < len(delays):
+                    m['next_reminder_at'] = (
+                        now_dt + datetime.timedelta(minutes=delays[count])
+                    ).isoformat()
+                else:
+                    m['next_reminder_at'] = None
+                changed = True
+                claimed.setdefault(school_key, []).append(dict(m))
+        if changed:
+            _save_json_atomic(MESSAGES_FILE, store)
+    return claimed
+
+
+def _send_due_reminders():
+    claimed = _claim_due_reminders()
+    for school_key, entries in claimed.items():
+        try:
+            notify_parents_of_messages(school_key, entries, reminder=True)
+            logger.info("⏰ Rappels urgents : école='%s' %d message(s)",
+                        school_key, len(entries))
+        except Exception:
+            logger.exception("Rappels urgents : envoi échoué (non bloquant)")
+
+
+def _reminder_loop():
+    while True:
+        try:
+            _send_due_reminders()
+        except Exception:
+            logger.exception("Robot de rappels : erreur (il continue)")
+        time.sleep(URGENT_WORKER_INTERVAL_SEC)
+
+
+def _ensure_reminder_worker():
+    """Démarre le robot une seule fois PAR PROCESSUS. Mettre la variable
+    d'environnement DISABLE_REMINDER_WORKER=1 pour le désactiver."""
+    if os.environ.get('DISABLE_REMINDER_WORKER') == '1':
+        return
+    pid = os.getpid()
+    if _reminder_state["pid"] == pid:
+        return
+    with _reminder_start_lock:
+        if _reminder_state["pid"] == pid:
+            return
+        _reminder_state["pid"] = pid
+        threading.Thread(
+            target=_reminder_loop, daemon=True, name="urgent-reminders"
+        ).start()
+        logger.info("⏰ Robot des rappels urgents démarré (pid=%s)", pid)
+
+
+# --------------------------------------------------------------------
 # ENVOIS DE L'ÉCOLE (absences, convocation, communiqués) — inchangés
 # côté application école, mais ils déclenchent maintenant AUSSI la
-# notification push sur le téléphone des parents.
+# notification push sur le téléphone des parents. Les convocations,
+# communiqués et messages libres acceptent maintenant "urgent": true.
 # --------------------------------------------------------------------
 
 @app.route('/school/record_absences', methods=['POST'])
@@ -2968,6 +3212,7 @@ def send_convocation():
         student_id  = data.get('student_id')
         title       = (data.get('title') or 'Convocation des parents').strip()
         message     = (data.get('message') or '').strip()
+        urgent      = _as_bool(data.get('urgent', False))
 
         if not school_code or not student_id or not message:
             return jsonify({"error": "Données manquantes"}), 400
@@ -2978,17 +3223,20 @@ def send_convocation():
             extra = {"nom_eleve": f"{stu.get('nom','')} {stu.get('postNom','')}".strip(),
                      "classe": stu.get('classe', '')}
         entry = _add_message_for_student(
-            school_code, student_id, "convocation", title, message, extra=extra)
+            school_code, student_id, "convocation", title, message,
+            extra=extra, urgent=urgent)
 
         _run_async(notify_parents_of_messages, school_code, [entry])
         notify_school_role(
             school_code, "promoteur",
-            "Convocation envoyée",
+            "Convocation envoyée" + (" (URGENTE)" if urgent else ""),
             f"{title} — élève {student_id}.",
             data={"type": "convocation", "school_code": school_code},
         )
 
-        return jsonify({"message": "Convocation envoyée", "id": entry["id"]}), 200
+        return jsonify({"message": "Convocation envoyée", "id": entry["id"],
+                        "batch_id": entry.get("batch_id"),
+                        "urgent": urgent}), 200
     except Exception as e:
         logger.exception("Erreur send_convocation")
         return jsonify({"error": str(e)}), 500
@@ -3007,6 +3255,7 @@ def send_announcement():
         classe      = data.get('classe', '')
         section     = data.get('section', '')
         sections    = data.get('sections') or ([section] if section else [])
+        urgent      = _as_bool(data.get('urgent', False))
 
         if not school_code or not annee or not message:
             return jsonify({"error": "Données manquantes"}), 400
@@ -3038,6 +3287,7 @@ def send_announcement():
             items.append({
                 "student_id": sid, "type": "announcement",
                 "title": title, "message": message, "sender": "school",
+                "urgent": urgent,
                 "extra": {"nom_eleve": f"{e.get('nom','')} {e.get('postNom','')}".strip(),
                           "classe": e.get('classe', '')},
             })
@@ -3048,7 +3298,7 @@ def send_announcement():
             _run_async(notify_parents_of_messages, school_code, entries)
             notify_school_role(
                 school_code, "promoteur",
-                "Communiqué envoyé",
+                "Communiqué envoyé" + (" (URGENT)" if urgent else ""),
                 f"\"{title}\" envoyé à {len(entries)} élève(s).",
                 data={"type": "announcement", "school_code": school_code},
             )
@@ -3056,6 +3306,8 @@ def send_announcement():
         return jsonify({
             "message":        "Communiqué envoyé",
             "notified_count": len(entries),
+            "batch_id":       entries[0].get("batch_id") if entries else None,
+            "urgent":         urgent,
         }), 200
     except Exception as e:
         logger.exception("Erreur send_announcement")
@@ -3111,7 +3363,10 @@ def parent_mark_message_read():
             msg_list       = messages_store.get(school_key, [])
             for m in msg_list:
                 if m.get('id') == message_id:
-                    m['read'] = True
+                    if not m.get('read'):
+                        m['read'] = True
+                        m['read_at'] = _utc_now_iso()
+                        m.setdefault('delivered_at', m['read_at'])
                     found = True
                     break
             if found:
@@ -3133,7 +3388,9 @@ def parent_conversation():
       ?before_seq=N  → messages plus anciens que N (« charger plus »)
       (rien)         → les `limit` derniers messages
     Retourne aussi parent_read_up_to : plus grand seq d'un message du
-    parent déjà lu par l'école (pour afficher les ✓✓ bleus)."""
+    parent déjà lu par l'école (pour afficher les ✓✓ bleus), et
+    urgent_unread : nombre de messages urgents non lus.
+    Les messages de l'école récupérés ici sont notés « reçus » (delivered_at)."""
     try:
         student_id  = request.args.get('student_id', '').strip().upper()
         school_code = request.args.get('school_code', '').strip()
@@ -3152,9 +3409,19 @@ def parent_conversation():
                          default=0)
         last_seq   = max((m.get('seq') or 0 for m in msgs), default=0)
 
+        # le téléphone vient de télécharger ces messages → « reçu »
+        to_deliver = [m.get('seq') or 0 for m in window
+                      if _sender_of(m) != 'parent' and not m.get('delivered_at')]
+        if to_deliver:
+            try:
+                _mark_delivered(school_code, student_id, to_deliver)
+            except Exception:
+                logger.exception("mark_delivered : échec (non bloquant)")
+
         return jsonify({
             "messages":           [_public_message(m) for m in window],
             "unread_count":       _unread_for_parent(msgs),
+            "urgent_unread":      _urgent_unread_for_parent(msgs),
             "last_seq":           last_seq,
             "has_more_older":     has_more,
             "parent_read_up_to":  read_up_to,
@@ -3225,7 +3492,8 @@ def parent_send_message():
 @app.route('/parent/mark_conversation_read', methods=['POST'])
 def parent_mark_conversation_read():
     """Le parent a ouvert la conversation : tous les messages de l'école
-    (jusqu'à up_to_seq si fourni) passent à « lu » → le badge disparaît."""
+    (jusqu'à up_to_seq si fourni) passent à « lu » → le badge disparaît,
+    les rappels urgents s'arrêtent, et l'école voit « lu à HH:MM »."""
     try:
         data        = request.get_json(silent=True) or {}
         school_code = (data.get('school_code') or '').strip()
@@ -3249,6 +3517,9 @@ def parent_mark_conversation_read():
                         and (up_to <= 0 or (m.get('seq') or 0) <= up_to)):
                     m['read'] = True
                     m['read_at'] = now_iso
+                    m.setdefault('delivered_at', now_iso)
+                    if m.get('urgent'):
+                        m['next_reminder_at'] = None
                     marked += 1
             if marked:
                 store[school_key] = msg_list
@@ -3264,22 +3535,26 @@ def parent_mark_conversation_read():
 @app.route('/parent/conversations_summary', methods=['POST'])
 def parent_conversations_summary():
     """Page d'accueil de l'app : pour CHAQUE enfant suivi → nombre de non-lus
-    (badge), dernier message (aperçu) et son horodatage. Un seul appel."""
+    (badge), nombre d'urgents non lus (pastille rouge), dernier message
+    (aperçu) et son horodatage. Un seul appel."""
     try:
         data     = request.get_json(silent=True) or {}
         children = _clean_children(data.get('children'))
         store    = _load_json(MESSAGES_FILE, {})
-        summaries, total = [], 0
+        summaries, total, total_urgent = [], 0, 0
         for c in children:
             msgs = _student_messages(store.get(c['school_code'], []), c['student_id'])
             unread = _unread_for_parent(msgs)
+            urgent_unread = _urgent_unread_for_parent(msgs)
             total += unread
+            total_urgent += urgent_unread
             last = max(msgs, key=lambda m: m.get('seq') or 0) if msgs else None
             summaries.append({
-                "school_code":  c['school_code'],
-                "student_id":   c['student_id'],
-                "unread_count": unread,
-                "last_seq":     (last.get('seq') or 0) if last else 0,
+                "school_code":   c['school_code'],
+                "student_id":    c['student_id'],
+                "unread_count":  unread,
+                "urgent_unread": urgent_unread,
+                "last_seq":      (last.get('seq') or 0) if last else 0,
                 "last_message": ({
                     "type":       last.get('type', 'message'),
                     "title":      last.get('title', ''),
@@ -3288,14 +3563,16 @@ def parent_conversations_summary():
                     "created_at": last.get('created_at', ''),
                 } if last else None),
             })
-        return jsonify({"summaries": summaries, "total_unread": total}), 200
+        return jsonify({"summaries": summaries, "total_unread": total,
+                        "total_urgent_unread": total_urgent}), 200
     except Exception as e:
         logger.exception("Erreur parent_conversations_summary")
         return jsonify({"error": str(e)}), 500
 
 
 # --------------------------------------------------------------------
-# CÔTÉ ÉCOLE — voir les messages des parents et leur répondre
+# CÔTÉ ÉCOLE — voir les messages des parents, leur répondre, et suivre
+# la CONFIRMATION DE LECTURE de tout ce que l'école a envoyé
 # (à brancher dans l'application école/promoteur)
 # --------------------------------------------------------------------
 
@@ -3376,7 +3653,9 @@ def school_get_conversation():
 @app.route('/school/reply_message', methods=['POST'])
 def school_reply_message():
     """L'école écrit librement au parent d'un élève (réponse ou message
-    spontané). Le parent reçoit une notification push."""
+    spontané). Le parent reçoit une notification push. Avec "urgent": true
+    (ex. élève malade), le parent reçoit des rappels vibrants tant qu'il
+    n'a pas lu le message."""
     try:
         data        = request.get_json(silent=True) or {}
         school_code = (data.get('school_code') or '').strip()
@@ -3385,6 +3664,7 @@ def school_reply_message():
         client_id   = (data.get('client_id') or '').strip()[:80] or None
         sender_name = (data.get('sender_name') or '').strip()[:60]
         title       = (data.get('title') or "Message de l'école").strip()[:80]
+        urgent      = _as_bool(data.get('urgent', False))
         if not school_code or not student_id or not text:
             return jsonify({"error": "Données manquantes"}), 400
         if len(text) > MAX_MESSAGE_LENGTH:
@@ -3400,7 +3680,7 @@ def school_reply_message():
         res = _add_messages_bulk(school_code, [{
             "student_id": student_id, "type": "message", "title": title,
             "message": text, "sender": "school", "client_id": client_id,
-            "extra": extra,
+            "extra": extra, "urgent": urgent,
         }])
         entry, created = res[0]
         if created:
@@ -3443,16 +3723,240 @@ def school_mark_conversation_read():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route('/school/get_sent_messages', methods=['GET'])
+def school_get_sent_messages():
+    """⚡ NOUVEAU — Écran « Messages envoyés » de l'école.
+    Liste des ENVOIS de l'école (un communiqué envoyé à 30 élèves = 1 ligne),
+    du plus récent au plus ancien, avec pour chacun le nombre de parents qui
+    ont LU / pas encore lu.
+
+    Paramètres (tous optionnels sauf school_code) :
+      limit=50            nombre d'envois par page (1..200)
+      before_seq=N        page suivante : envois dont max_seq < N
+      student_id=ID       uniquement les messages envoyés à cet élève
+      type=announcement   absence | convocation | announcement | message
+      urgent_only=1       uniquement les urgents
+      pending_only=1      uniquement ceux qui ont encore des non-lus
+
+    Pour la liste détaillée des parents d'un envoi : /school/get_message_receipts"""
+    try:
+        school_code = request.args.get('school_code', '').strip()
+        if not school_code:
+            return jsonify({"error": "Code manquant"}), 400
+        limit        = _int_arg('limit', 50, 1, 200)
+        before_seq   = _int_arg('before_seq')
+        student_id   = request.args.get('student_id', '').strip().upper()
+        type_filter  = request.args.get('type', '').strip()
+        urgent_only  = _as_bool(request.args.get('urgent_only', '0'))
+        pending_only = _as_bool(request.args.get('pending_only', '0'))
+
+        store    = _load_json(MESSAGES_FILE, {})
+        msg_list = store.get(school_code.lower(), [])
+        students = _school_students_map(school_code)
+
+        sent = [m for m in msg_list if _sender_of(m) != 'parent']
+        if student_id:
+            sent = [m for m in sent
+                    if (m.get('student_id') or '').upper() == student_id]
+
+        stats_read   = sum(1 for m in sent if m.get('read'))
+        stats = {
+            "sent":          len(sent),
+            "read":          stats_read,
+            "unread":        len(sent) - stats_read,
+            "urgent_unread": sum(1 for m in sent
+                                 if m.get('urgent') and not m.get('read')),
+        }
+
+        groups = {}
+        for m in sent:
+            groups.setdefault(m.get('batch_id') or m.get('id'), []).append(m)
+
+        rows = []
+        for key, msgs in groups.items():
+            msgs.sort(key=lambda m: m.get('seq') or 0)
+            first    = msgs[0]
+            max_seq  = max((m.get('seq') or 0) for m in msgs)
+            m_type   = first.get('type') or 'message'
+            urgent   = any(m.get('urgent') for m in msgs)
+            total    = len(msgs)
+            read_n   = sum(1 for m in msgs if m.get('read'))
+            deliv_n  = sum(1 for m in msgs if m.get('delivered_at') or m.get('read'))
+            if type_filter and m_type != type_filter:
+                continue
+            if urgent_only and not urgent:
+                continue
+            if pending_only and read_n == total:
+                continue
+            if before_seq and max_seq >= before_seq:
+                continue
+            rows.append({
+                "batch_id":        key,
+                "type":            m_type,
+                "title":           first.get('title', ''),
+                "message":         first.get('message', ''),
+                "created_at":      first.get('created_at', ''),
+                "max_seq":         max_seq,
+                "urgent":          urgent,
+                "total":           total,
+                "delivered_count": deliv_n,
+                "read_count":      read_n,
+                "unread_count":    total - read_n,
+                "reminders_sent":  max((m.get('reminder_count') or 0) for m in msgs),
+                "unread_names":    [_student_label(students, m)
+                                    for m in msgs if not m.get('read')][:3],
+            })
+
+        rows.sort(key=lambda r: r['max_seq'], reverse=True)
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+        return jsonify({
+            "batches":  rows,
+            "has_more": has_more,
+            "stats":    stats,
+        }), 200
+    except Exception as e:
+        logger.exception("Erreur school_get_sent_messages")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/school/get_message_receipts', methods=['GET'])
+def school_get_message_receipts():
+    """⚡ NOUVEAU — Détail d'UN envoi : pour chaque élève (donc chaque
+    parent) → « lu à 14:32 », « reçu mais pas lu », « pas encore reçu »,
+    et le nombre de téléphones enregistrés (0 = ce parent ne peut pas
+    recevoir de notification).
+    Paramètres : school_code, batch_id (celui renvoyé par get_sent_messages)."""
+    try:
+        school_code = request.args.get('school_code', '').strip()
+        batch_id    = request.args.get('batch_id', '').strip()
+        if not school_code or not batch_id:
+            return jsonify({"error": "Paramètres manquants"}), 400
+
+        store    = _load_json(MESSAGES_FILE, {})
+        msg_list = store.get(school_code.lower(), [])
+        msgs = [m for m in msg_list
+                if _sender_of(m) != 'parent'
+                and (m.get('batch_id') == batch_id or m.get('id') == batch_id)]
+        if not msgs:
+            return jsonify({"error": "Envoi introuvable"}), 404
+
+        students = _school_students_map(school_code)
+        devices  = _devices_count_by_student(school_code)
+
+        recipients = []
+        for m in msgs:
+            sid = (m.get('student_id') or '').upper()
+            stu = students.get(sid, {})
+            if m.get('read'):
+                status = 'read'
+            elif m.get('delivered_at'):
+                status = 'delivered'
+            else:
+                status = 'sent'
+            recipients.append({
+                "message_id":     m.get('id'),
+                "student_id":     sid,
+                "nom_eleve":      _student_label(students, m),
+                "classe":         stu.get('classe') or m.get('classe', ''),
+                "section":        stu.get('section', ''),
+                "status":         status,      # read | delivered | sent
+                "read":           bool(m.get('read')),
+                "read_at":        m.get('read_at'),
+                "delivered_at":   m.get('delivered_at'),
+                "devices":        devices.get(sid, 0),
+                "reminder_count": m.get('reminder_count') or 0,
+                "reminders_stopped": bool(m.get('reminders_stopped')),
+            })
+        order = {'sent': 0, 'delivered': 1, 'read': 2}
+        recipients.sort(key=lambda r: (order[r['status']], r['nom_eleve']))
+
+        msgs.sort(key=lambda m: m.get('seq') or 0)
+        first   = msgs[0]
+        read_n  = sum(1 for r in recipients if r['read'])
+        return jsonify({
+            "batch": {
+                "batch_id":     batch_id,
+                "type":         first.get('type') or 'message',
+                "title":        first.get('title', ''),
+                "message":      first.get('message', ''),
+                "created_at":   first.get('created_at', ''),
+                "urgent":       any(m.get('urgent') for m in msgs),
+                "total":        len(recipients),
+                "read_count":   read_n,
+                "unread_count": len(recipients) - read_n,
+                "no_device_count": sum(1 for r in recipients if r['devices'] == 0),
+            },
+            "recipients": recipients,
+        }), 200
+    except Exception as e:
+        logger.exception("Erreur school_get_message_receipts")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/school/stop_reminders', methods=['POST'])
+def school_stop_reminders():
+    """⚡ NOUVEAU — L'école arrête les rappels vibrants d'un message urgent
+    (par exemple parce qu'elle a joint le parent par téléphone).
+    Corps : school_code + (batch_id OU message_id)."""
+    try:
+        data        = request.get_json(silent=True) or {}
+        school_code = (data.get('school_code') or '').strip()
+        batch_id    = (data.get('batch_id') or '').strip()
+        message_id  = (data.get('message_id') or '').strip()
+        if not school_code or not (batch_id or message_id):
+            return jsonify({"error": "Données manquantes"}), 400
+
+        stopped = 0
+        with _messages_lock():
+            store      = _load_json(MESSAGES_FILE, {})
+            school_key = school_code.lower()
+            msg_list   = store.get(school_key, [])
+            for m in msg_list:
+                if _sender_of(m) == 'parent' or not m.get('urgent'):
+                    continue
+                hit = ((batch_id and m.get('batch_id') == batch_id)
+                       or (message_id and m.get('id') == message_id))
+                if hit and not m.get('read') and not m.get('reminders_stopped'):
+                    m['reminders_stopped'] = True
+                    m['next_reminder_at'] = None
+                    stopped += 1
+            if stopped:
+                store[school_key] = msg_list
+                _save_json_atomic(MESSAGES_FILE, store)
+        return jsonify({"stopped": stopped}), 200
+    except Exception as e:
+        logger.exception("Erreur school_stop_reminders")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/school/emergency_call', methods=['POST'])
+def school_emergency_call():
+    """⚡ RÉSERVÉ — Appel vocal automatique au parent en cas d'urgence.
+    PAS ENCORE ACTIF : il faut (1) un service d'appel payant (Twilio,
+    Africa's Talking…) et (2) le numéro de téléphone du parent, que
+    l'application ne stocke pas aujourd'hui. En attendant, utilisez
+    /school/reply_message avec "urgent": true (notification + vibration
+    répétée jusqu'à la lecture)."""
+    return jsonify({
+        "available": False,
+        "error": ("Appel vocal non configuré : service d'appel et numéro "
+                  "du parent requis. Utilisez un message urgent en attendant."),
+    }), 501
+
+
 @app.route('/admin/test_parent_push', methods=['POST'])
 def admin_test_parent_push():
     """Outil de diagnostic : envoie une notification de test aux téléphones
-    enregistrés pour un élève. Corps : admin_password, school_code, student_id."""
+    enregistrés pour un élève. Corps : admin_password, school_code, student_id,
+    urgent (optionnel : true pour tester la vibration forte)."""
     try:
         data = request.get_json(silent=True) or {}
         if data.get('admin_password') != ADMIN_PASSWORD:
             return jsonify({"error": "Accès refusé"}), 401
         school_code = (data.get('school_code') or '').strip()
         student_id  = (data.get('student_id') or '').strip().upper()
+        urgent      = _as_bool(data.get('urgent', False))
         devices = _load_json(PARENT_DEVICES_FILE, {})
         nb = sum(1 for d in devices.values()
                  for c in d.get('children', [])
@@ -3467,9 +3971,11 @@ def admin_test_parent_push():
                             "devices_for_student": 0}), 404
         fake = {"id": "test", "type": "announcement", "student_id": student_id,
                 "title": "Test de notification",
+                "urgent": urgent,
                 "message": "Si vous lisez ceci, les notifications fonctionnent ✅"}
         notify_parents_of_messages(school_code, [fake])
         return jsonify({"message": "Notification de test envoyée",
+                        "urgent": urgent,
                         "devices_for_student": nb}), 200
     except Exception as e:
         logger.exception("Erreur admin_test_parent_push")
@@ -3477,6 +3983,7 @@ def admin_test_parent_push():
 
 
 _migrate_messages_store()
+_ensure_reminder_worker()
 
 
 # ====================================================================
@@ -3723,6 +4230,16 @@ def admin_health():
             except Exception:
                 details.append({"school_code": fname, "error": "fichier corrompu"})
 
+        urgent_pending = 0
+        try:
+            msg_store = _load_json(MESSAGES_FILE, {})
+            urgent_pending = sum(
+                1 for lst in msg_store.values() for m in lst
+                if m.get('urgent') and not m.get('read')
+                and _sender_of(m) != 'parent')
+        except Exception:
+            pass
+
         return jsonify({
             "server_time":     datetime.datetime.now().isoformat(),
             "data_dir":        os.path.abspath(DATA_DIR),
@@ -3731,6 +4248,8 @@ def admin_health():
             "subscription_mode": "TEST (1 minute)" if SUBSCRIPTION_TEST_MODE else "PRODUCTION (30 jours)",
             "firebase_ready":  _firebase_ready(),
             "parent_devices":  len(_load_json(PARENT_DEVICES_FILE, {})),
+            "urgent_unread_messages": urgent_pending,
+            "reminder_worker_running": _reminder_state["pid"] == os.getpid(),
         }), 200
     except Exception as e:
         logger.exception("Erreur admin_health")
