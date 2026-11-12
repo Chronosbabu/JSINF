@@ -8,6 +8,12 @@ import string
 import logging
 import sys
 import hashlib
+import threading
+import contextlib
+try:
+    import fcntl
+except ImportError:          # Windows (dev local) : pas de verrou inter-processus
+    fcntl = None
 import firebase_admin
 from firebase_admin import credentials, messaging
 
@@ -30,6 +36,7 @@ PROMOTER_SUMMARY_FILE       = os.path.join(DATA_DIR, "promoter_summary.json")
 PROMOTER_PENDING_REQUESTS_FILE  = os.path.join(DATA_DIR, "promoter_pending_requests.json")
 PROMOTER_RESOLVED_REQUESTS_FILE = os.path.join(DATA_DIR, "promoter_resolved_requests.json")
 FCM_TOKENS_FILE             = os.path.join(DATA_DIR, "fcm_tokens.json")
+PARENT_DEVICES_FILE         = os.path.join(DATA_DIR, "parent_devices.json")
 
 ADMIN_PASSWORD = "edupay_admin_2026"
 
@@ -60,6 +67,7 @@ SYSTEM_FILES = {
     'promoter_summary.json', 'promoter_pending_requests.json',
     'promoter_resolved_requests.json',
     'fcm_tokens.json',
+    'parent_devices.json',
 }
 
 logging.basicConfig(
@@ -2411,31 +2419,452 @@ def reject_autre_frais_payment():
         return jsonify({"error": str(e)}), 500
 
 
+# ====================================================================
+# MESSAGERIE ÉCOLE ⇄ PARENTS — une conversation par élève (façon
+# WhatsApp). Chaque message a un `seq` croissant (par école) qui sert
+# de curseur de synchronisation fiable : l'application demande
+# « donne-moi tout ce qui a un seq > X » et ne rate ni ne duplique rien.
+#
+#   sender = 'school' → message envoyé PAR l'école au parent
+#   sender = 'parent' → message envoyé PAR le parent à l'école
+#   read   = le DESTINATAIRE a lu le message
+#            (école→parent : le parent l'a lu ; parent→école : l'école l'a lu)
+# Les anciens messages (sans 'sender'/'seq') restent valides : ils sont
+# considérés comme venant de l'école et reçoivent un seq au démarrage.
+# ====================================================================
+
+MAX_MESSAGE_LENGTH      = 2000
+PARENT_RATE_LIMIT       = 20          # messages max / minute / élève
+PARENT_PUSH_CHANNEL_ID  = "edupay_parent_messages"
+MAX_CHILDREN_PER_DEVICE = 30
+
+_MSG_THREAD_LOCK = threading.RLock()
+_MSG_LOCK_FILE   = os.path.join(DATA_DIR, "parent_messages.lock")
+
+
+@contextlib.contextmanager
+def _messages_lock():
+    """Verrou inter-threads ET inter-processus (gunicorn multi-workers) :
+    évite que deux envois simultanés s'écrasent dans parent_messages.json."""
+    with _MSG_THREAD_LOCK:
+        lock_fd = None
+        try:
+            if fcntl is not None:
+                lock_fd = open(_MSG_LOCK_FILE, 'a')
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            if lock_fd is not None:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                finally:
+                    lock_fd.close()
+
+
+def _save_json_atomic(path, data):
+    """Écriture atomique : le fichier n'est jamais à moitié écrit, même si
+    le serveur redémarre au milieu d'une sauvegarde."""
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def _utc_now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def _sender_of(m):
+    return m.get('sender') or 'school'
+
+
+def _preview(text, n=140):
+    text = (text or '').strip().replace('\n', ' ')
+    return text if len(text) <= n else text[:n - 1].rstrip() + '…'
+
+
+def _run_async(fn, *args, **kwargs):
+    """Lance un travail en arrière-plan (envoi push) pour que la réponse
+    HTTP reste instantanée."""
+    def _runner():
+        try:
+            fn(*args, **kwargs)
+        except Exception:
+            logger.exception("Tâche d'arrière-plan : échec (non bloquant)")
+    threading.Thread(target=_runner, daemon=True).start()
+
+
+def _migrate_messages_store():
+    """Donne un `seq` aux anciens messages (une seule fois)."""
+    try:
+        with _messages_lock():
+            store = _load_json(MESSAGES_FILE, {})
+            changed = False
+            for _key, lst in store.items():
+                missing = [m for m in lst if not m.get('seq')]
+                if not missing:
+                    continue
+                top = max((m.get('seq') or 0 for m in lst), default=0)
+                missing.sort(key=lambda m: m.get('created_at', ''))
+                for m in missing:
+                    top += 1
+                    m['seq'] = top
+                changed = True
+            if changed:
+                _save_json_atomic(MESSAGES_FILE, store)
+                logger.info("📨 Migration messages : seq ajoutés aux anciens messages.")
+    except Exception:
+        logger.exception("Migration messages : échec (non bloquant)")
+
+
+def _school_students_map(school_code):
+    """{ID_ELEVE_MAJ: {nom, postNom, prenom, classe, section}} pour l'école."""
+    out = {}
+    try:
+        fpath = os.path.join(DATA_DIR, f"{school_code.strip().lower()}.json")
+        if not os.path.exists(fpath):
+            return out
+        with open(fpath, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        for yd in data.get('history', {}).values():
+            for e in yd.get('eleves', []):
+                sid = (e.get('id') or '').upper()
+                if sid:
+                    out[sid] = {
+                        "nom":     e.get('nom', ''),
+                        "postNom": e.get('postNom', ''),
+                        "prenom":  e.get('prenom', ''),
+                        "classe":  e.get('classe', ''),
+                        "section": e.get('section', ''),
+                    }
+    except Exception:
+        logger.exception("_school_students_map : échec")
+    return out
+
+
+def _add_messages_bulk(school_code, items):
+    """Ajoute plusieurs messages en UNE seule lecture/écriture du fichier.
+    items = liste de dict(student_id, type, title, message, sender, extra,
+    client_id). Retourne la liste de (entry, created_bool).
+    Idempotent : un même (student_id, client_id) n'est jamais dupliqué."""
+    school_key = school_code.strip().lower()
+    results = []
+    with _messages_lock():
+        store    = _load_json(MESSAGES_FILE, {})
+        msg_list = store.get(school_key, [])
+        seq      = max((m.get('seq') or 0 for m in msg_list), default=0)
+        now_iso  = _utc_now_iso()
+        today    = datetime.date.today().isoformat()
+        known    = {}
+        for m in msg_list:
+            if m.get('client_id'):
+                known[(m.get('student_id', '').upper(), m['client_id'])] = m
+
+        for it in items:
+            sid = (it.get('student_id') or '').strip().upper()
+            cid = it.get('client_id')
+            if cid and (sid, cid) in known:
+                results.append((known[(sid, cid)], False))
+                continue
+            seq += 1
+            entry = {
+                "id":         _new_message_id(),
+                "seq":        seq,
+                "type":       it.get('type') or 'message',
+                "student_id": sid,
+                "title":      it.get('title') or '',
+                "message":    it.get('message') or '',
+                "sender":     it.get('sender') or 'school',
+                "date":       today,
+                "created_at": now_iso,
+                "read":       False,
+            }
+            if cid:
+                entry["client_id"] = cid
+                known[(sid, cid)] = entry
+            if it.get('extra'):
+                entry.update(it['extra'])
+            msg_list.append(entry)
+            results.append((entry, True))
+
+        store[school_key] = msg_list
+        _save_json_atomic(MESSAGES_FILE, store)
+    return results
+
+
 def _new_message_id():
     return f"msg_{datetime.datetime.now().strftime('%Y%m%d%H%M%S%f')}_{os.urandom(3).hex()}"
 
 
 def _add_message_for_student(school_code, student_id, msg_type, title, message, extra=None):
-    messages_store = _load_json(MESSAGES_FILE, {})
-    school_key     = school_code.lower()
-    msg_list       = messages_store.get(school_key, [])
-    entry = {
-        "id":         _new_message_id(),
-        "type":       msg_type,
-        "student_id": student_id,
-        "title":      title,
-        "message":    message,
-        "date":       datetime.date.today().isoformat(),
-        "created_at": datetime.datetime.now().isoformat(),
-        "read":       False,
-    }
-    if extra:
-        entry.update(extra)
-    msg_list.append(entry)
-    messages_store[school_key] = msg_list
-    _save_json(MESSAGES_FILE, messages_store)
-    return entry
+    """Compatibilité avec l'ancien code : message ÉCOLE → parent."""
+    res = _add_messages_bulk(school_code, [{
+        "student_id": student_id, "type": msg_type, "title": title,
+        "message": message, "sender": "school", "extra": extra,
+    }])
+    return res[0][0]
 
+
+def _public_message(m):
+    out = dict(m)
+    out['sender'] = _sender_of(m)
+    return out
+
+
+def _student_messages(msg_list, student_id):
+    sid = student_id.strip().upper()
+    return [m for m in msg_list if (m.get('student_id') or '').upper() == sid]
+
+
+def _unread_for_parent(msgs):
+    return sum(1 for m in msgs if _sender_of(m) != 'parent' and not m.get('read'))
+
+
+def _unread_for_school(msgs):
+    return sum(1 for m in msgs if _sender_of(m) == 'parent' and not m.get('read'))
+
+
+def _slice_conversation(msgs, after_seq, before_seq, limit):
+    """Retourne (messages_asc, has_more_older)."""
+    msgs = sorted(msgs, key=lambda m: m.get('seq') or 0)
+    if after_seq > 0:
+        out = [m for m in msgs if (m.get('seq') or 0) > after_seq][:max(limit, 1)]
+        return out, False
+    if before_seq > 0:
+        older = [m for m in msgs if (m.get('seq') or 0) < before_seq]
+        out = older[-limit:]
+        return out, len(older) > len(out)
+    out = msgs[-limit:]
+    return out, len(msgs) > len(out)
+
+
+def _int_arg(name, default=0, lo=0, hi=1000000000):
+    try:
+        v = int(request.args.get(name, default))
+    except (TypeError, ValueError):
+        v = default
+    return max(lo, min(hi, v))
+
+
+# --------------------------------------------------------------------
+# APPAREILS DES PARENTS (token FCM ⇄ élèves suivis)
+# --------------------------------------------------------------------
+
+def _clean_children(raw):
+    clean, seen = [], set()
+    for c in (raw or [])[:MAX_CHILDREN_PER_DEVICE]:
+        if not isinstance(c, dict):
+            continue
+        sc  = (c.get('school_code') or '').strip().lower()
+        sid = (c.get('student_id') or '').strip().upper()
+        if sc and sid and (sc, sid) not in seen:
+            seen.add((sc, sid))
+            clean.append({"school_code": sc, "student_id": sid})
+    return clean
+
+
+@app.route('/parent/register_device', methods=['POST'])
+def parent_register_device():
+    """L'app parent envoie son token FCM + la liste COMPLÈTE des élèves
+    qu'elle suit. Appelée au démarrage, quand le token change, et quand
+    le parent ajoute/retire un enfant. Liste vide = désinscription."""
+    try:
+        data     = request.get_json(silent=True) or {}
+        token    = (data.get('token') or '').strip()
+        platform = (data.get('platform') or 'unknown').strip()
+        children = _clean_children(data.get('children'))
+        if not token:
+            return jsonify({"error": "Token manquant"}), 400
+
+        with _messages_lock():
+            devices = _load_json(PARENT_DEVICES_FILE, {})
+            if children:
+                devices[token] = {
+                    "platform":   platform,
+                    "children":   children,
+                    "updated_at": _utc_now_iso(),
+                }
+            else:
+                devices.pop(token, None)
+            _save_json_atomic(PARENT_DEVICES_FILE, devices)
+
+        logger.info("📱 parent_register_device : %d élève(s), plateforme=%s",
+                    len(children), platform)
+        return jsonify({"message": "Appareil enregistré",
+                        "children": len(children)}), 200
+    except Exception as e:
+        logger.exception("Erreur parent_register_device")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/parent/unregister_device', methods=['POST'])
+def parent_unregister_device():
+    try:
+        data  = request.get_json(silent=True) or {}
+        token = (data.get('token') or '').strip()
+        if not token:
+            return jsonify({"error": "Token manquant"}), 400
+        with _messages_lock():
+            devices = _load_json(PARENT_DEVICES_FILE, {})
+            devices.pop(token, None)
+            _save_json_atomic(PARENT_DEVICES_FILE, devices)
+        return jsonify({"message": "Appareil retiré"}), 200
+    except Exception as e:
+        logger.exception("Erreur parent_unregister_device")
+        return jsonify({"error": str(e)}), 500
+
+
+def _remove_invalid_parent_tokens(tokens):
+    if not tokens:
+        return
+    with _messages_lock():
+        devices = _load_json(PARENT_DEVICES_FILE, {})
+        n = 0
+        for t in tokens:
+            if devices.pop(t, None) is not None:
+                n += 1
+        if n:
+            _save_json_atomic(PARENT_DEVICES_FILE, devices)
+            logger.info("🧹 %d appareil(s) parent invalide(s) retiré(s)", n)
+
+
+def _is_dead_token_error(exc):
+    try:
+        if isinstance(exc, (messaging.UnregisteredError,
+                            messaging.SenderIdMismatchError)):
+            return True
+    except Exception:
+        pass
+    s = str(exc)
+    return 'UNREGISTERED' in s or 'registration-token-not-registered' in s
+
+
+def notify_parents_of_messages(school_code, entries):
+    """Envoie une notification push aux téléphones des parents concernés.
+    `entries` = messages (sender='school') qui viennent d'être créés.
+    Un téléphone qui suit plusieurs élèves visés reçoit UNE seule
+    notification. Le badge iOS = total des non-lus de ses enfants."""
+    if not entries or not _firebase_ready():
+        return
+    school_key = school_code.strip().lower()
+    by_student = {}
+    for e in entries:
+        by_student[(e.get('student_id') or '').upper()] = e
+
+    devices = _load_json(PARENT_DEVICES_FILE, {})
+    if not devices:
+        return
+
+    students = _school_students_map(school_code)
+    store    = _load_json(MESSAGES_FILE, {})
+    msg_list = store.get(school_key, [])
+    unread_by_student = {}
+    for m in msg_list:
+        if _sender_of(m) != 'parent' and not m.get('read'):
+            sid = (m.get('student_id') or '').upper()
+            unread_by_student[sid] = unread_by_student.get(sid, 0) + 1
+
+    def first_name(sid):
+        s = students.get(sid) or {}
+        return s.get('prenom') or s.get('nom') or sid
+
+    outgoing, tokens_order = [], []
+    for token, dev in devices.items():
+        kids = dev.get('children', [])
+        matched = [c['student_id'].upper() for c in kids
+                   if c.get('school_code', '').lower() == school_key
+                   and c.get('student_id', '').upper() in by_student]
+        if not matched:
+            continue
+
+        ref = by_student[matched[0]]
+        if len(matched) == 1:
+            title = ref.get('title') or "Nouveau message de l'école"
+            body  = f"{first_name(matched[0])} : {_preview(ref.get('message'), 110)}"
+            tag   = matched[0]
+        else:
+            title = f"{len(matched)} nouveaux messages de l'école"
+            body  = "Pour " + ", ".join(first_name(s) for s in matched[:4])
+            if len(matched) > 4:
+                body += "…"
+            tag = None
+
+        badge = sum(unread_by_student.get((c.get('student_id') or '').upper(), 0)
+                    for c in kids if c.get('school_code', '').lower() == school_key)
+
+        data_payload = {
+            "type":        "parent_message",
+            "school_code": school_code,
+            "student_id":  matched[0],
+            "message_id":  str(ref.get('id', '')),
+            "msg_type":    str(ref.get('type', '')),
+        }
+        outgoing.append(messaging.Message(
+            token=token,
+            notification=messaging.Notification(title=title, body=body),
+            data=data_payload,
+            android=messaging.AndroidConfig(
+                priority='high',
+                ttl=datetime.timedelta(days=3),
+                notification=messaging.AndroidNotification(
+                    channel_id=PARENT_PUSH_CHANNEL_ID,
+                    sound='default',
+                    tag=tag,
+                ),
+            ),
+            apns=messaging.APNSConfig(
+                payload=messaging.APNSPayload(
+                    aps=messaging.Aps(sound='default', badge=max(badge, 1)),
+                ),
+            ),
+        ))
+        tokens_order.append(token)
+
+    if not outgoing:
+        return
+
+    dead = []
+    for i in range(0, len(outgoing), 500):
+        chunk = outgoing[i:i + 500]
+        try:
+            resp = messaging.send_each(chunk)
+        except Exception as e:
+            logger.error("❌ Envoi FCM parents (lot) : %s", e)
+            continue
+        for idx, r in enumerate(resp.responses):
+            if r.success:
+                continue
+            if _is_dead_token_error(r.exception):
+                dead.append(tokens_order[i + idx])
+            else:
+                logger.warning("⚠️ Échec push parent (token conservé) : %s", r.exception)
+    _remove_invalid_parent_tokens(dead)
+    logger.info("🔔 Push parents : %d envoyé(s), %d token(s) mort(s)",
+                len(outgoing), len(dead))
+
+
+def _notify_school_of_parent_message(school_code, entry, student_label):
+    for role in ("promoteur", "direction"):
+        notify_school_role(
+            school_code, role,
+            f"Message d'un parent — {student_label}",
+            _preview(entry.get('message'), 110),
+            data={
+                "type":        "parent_reply",
+                "school_code": school_code,
+                "student_id":  entry.get('student_id', ''),
+                "message_id":  str(entry.get('id', '')),
+            },
+        )
+
+
+# --------------------------------------------------------------------
+# ENVOIS DE L'ÉCOLE (absences, convocation, communiqués) — inchangés
+# côté application école, mais ils déclenchent maintenant AUSSI la
+# notification push sur le téléphone des parents.
+# --------------------------------------------------------------------
 
 @app.route('/school/record_absences', methods=['POST'])
 def record_absences():
@@ -2481,30 +2910,32 @@ def record_absences():
             "sans justification. Merci de contacter l'administration "
             "pour toute clarification.")
 
-        sent = []
+        items = []
         for sid in absent_ids:
             eleve       = eleves_by_id.get(sid)
             nom_complet = (f"{eleve.get('nom','')} {eleve.get('postNom','')}".strip()
                            if eleve else sid)
-            _add_message_for_student(
-                school_code, sid, "absence",
-                "Absence non justifiée",
-                default_text,
-                extra={"nom_eleve": nom_complet, "classe": classe},
-            )
-            sent.append(sid)
+            items.append({
+                "student_id": sid, "type": "absence",
+                "title": "Absence non justifiée", "message": default_text,
+                "sender": "school",
+                "extra": {"nom_eleve": nom_complet, "classe": classe},
+            })
+        created = _add_messages_bulk(school_code, items) if items else []
+        entries = [e for e, _new in created]
 
-        if sent:
+        if entries:
+            _run_async(notify_parents_of_messages, school_code, entries)
             notify_school_role(
                 school_code, "promoteur",
                 "Absences enregistrées",
-                f"{len(sent)} élève(s) marqué(s) absent(s) — {classe or 'toutes classes'}.",
+                f"{len(entries)} élève(s) marqué(s) absent(s) — {classe or 'toutes classes'}.",
                 data={"type": "absences", "school_code": school_code},
             )
 
         return jsonify({
             "message":        "Absences enregistrées et parents notifiés",
-            "notified_count": len(sent),
+            "notified_count": len(entries),
         }), 200
     except Exception as e:
         logger.exception("Erreur record_absences")
@@ -2541,9 +2972,15 @@ def send_convocation():
         if not school_code or not student_id or not message:
             return jsonify({"error": "Données manquantes"}), 400
 
+        stu   = _school_students_map(school_code).get(student_id.strip().upper(), {})
+        extra = {}
+        if stu:
+            extra = {"nom_eleve": f"{stu.get('nom','')} {stu.get('postNom','')}".strip(),
+                     "classe": stu.get('classe', '')}
         entry = _add_message_for_student(
-            school_code, student_id, "convocation", title, message)
+            school_code, student_id, "convocation", title, message, extra=extra)
 
+        _run_async(notify_parents_of_messages, school_code, [entry])
         notify_school_role(
             school_code, "promoteur",
             "Convocation envoyée",
@@ -2593,36 +3030,47 @@ def send_announcement():
         else:
             targeted = eleves
 
-        sent = []
+        items = []
         for e in targeted:
             sid = e.get('id')
             if not sid:
                 continue
-            _add_message_for_student(
-                school_code, sid, "announcement", title, message,
-                extra={"nom_eleve": f"{e.get('nom','')} {e.get('postNom','')}".strip()},
-            )
-            sent.append(sid)
+            items.append({
+                "student_id": sid, "type": "announcement",
+                "title": title, "message": message, "sender": "school",
+                "extra": {"nom_eleve": f"{e.get('nom','')} {e.get('postNom','')}".strip(),
+                          "classe": e.get('classe', '')},
+            })
+        created = _add_messages_bulk(school_code, items) if items else []
+        entries = [e for e, _new in created]
 
-        if sent:
+        if entries:
+            _run_async(notify_parents_of_messages, school_code, entries)
             notify_school_role(
                 school_code, "promoteur",
                 "Communiqué envoyé",
-                f"\"{title}\" envoyé à {len(sent)} élève(s).",
+                f"\"{title}\" envoyé à {len(entries)} élève(s).",
                 data={"type": "announcement", "school_code": school_code},
             )
 
         return jsonify({
             "message":        "Communiqué envoyé",
-            "notified_count": len(sent),
+            "notified_count": len(entries),
         }), 200
     except Exception as e:
         logger.exception("Erreur send_announcement")
         return jsonify({"error": str(e)}), 500
 
 
+# --------------------------------------------------------------------
+# CÔTÉ PARENT — conversation, envoi, lecture, résumé (badges)
+# --------------------------------------------------------------------
+
 @app.route('/parent/get_messages', methods=['GET'])
 def parent_get_messages():
+    """ANCIENNE route (conservée pour la version web /parent et les
+    anciennes versions de l'app) : messages de l'école uniquement,
+    du plus récent au plus ancien."""
     try:
         student_id  = request.args.get('student_id', '').strip().upper()
         school_code = request.args.get('school_code', '').strip()
@@ -2632,8 +3080,8 @@ def parent_get_messages():
         messages_store   = _load_json(MESSAGES_FILE, {})
         msg_list         = messages_store.get(school_code.lower(), [])
         student_messages = [
-            m for m in msg_list
-            if m.get('student_id', '').upper() == student_id
+            _public_message(m) for m in _student_messages(msg_list, student_id)
+            if _sender_of(m) != 'parent'
         ]
         student_messages.sort(key=lambda m: m.get('created_at', ''), reverse=True)
         unread_count = sum(1 for m in student_messages if not m.get('read'))
@@ -2656,17 +3104,19 @@ def parent_mark_message_read():
         if not school_code or not message_id:
             return jsonify({"error": "Données manquantes"}), 400
 
-        messages_store = _load_json(MESSAGES_FILE, {})
-        school_key     = school_code.lower()
-        msg_list       = messages_store.get(school_key, [])
         found = False
-        for m in msg_list:
-            if m.get('id') == message_id:
-                m['read'] = True
-                found = True
-                break
-        messages_store[school_key] = msg_list
-        _save_json(MESSAGES_FILE, messages_store)
+        with _messages_lock():
+            messages_store = _load_json(MESSAGES_FILE, {})
+            school_key     = school_code.lower()
+            msg_list       = messages_store.get(school_key, [])
+            for m in msg_list:
+                if m.get('id') == message_id:
+                    m['read'] = True
+                    found = True
+                    break
+            if found:
+                messages_store[school_key] = msg_list
+                _save_json_atomic(MESSAGES_FILE, messages_store)
 
         if not found:
             return jsonify({"error": "Message introuvable"}), 404
@@ -2674,6 +3124,359 @@ def parent_mark_message_read():
     except Exception as e:
         logger.exception("Erreur parent_mark_message_read")
         return jsonify({"error": str(e)}), 500
+
+
+@app.route('/parent/conversation', methods=['GET'])
+def parent_conversation():
+    """Conversation d'un élève, ORDRE CHRONOLOGIQUE.
+      ?after_seq=N   → uniquement les messages plus récents que N (polling)
+      ?before_seq=N  → messages plus anciens que N (« charger plus »)
+      (rien)         → les `limit` derniers messages
+    Retourne aussi parent_read_up_to : plus grand seq d'un message du
+    parent déjà lu par l'école (pour afficher les ✓✓ bleus)."""
+    try:
+        student_id  = request.args.get('student_id', '').strip().upper()
+        school_code = request.args.get('school_code', '').strip()
+        if not student_id or not school_code:
+            return jsonify({"error": "Paramètres manquants"}), 400
+        after_seq  = _int_arg('after_seq')
+        before_seq = _int_arg('before_seq')
+        limit      = _int_arg('limit', 100, 1, 500)
+
+        store    = _load_json(MESSAGES_FILE, {})
+        msgs     = _student_messages(store.get(school_code.lower(), []), student_id)
+        window, has_more = _slice_conversation(msgs, after_seq, before_seq, limit)
+
+        read_up_to = max((m.get('seq') or 0 for m in msgs
+                          if _sender_of(m) == 'parent' and m.get('read')),
+                         default=0)
+        last_seq   = max((m.get('seq') or 0 for m in msgs), default=0)
+
+        return jsonify({
+            "messages":           [_public_message(m) for m in window],
+            "unread_count":       _unread_for_parent(msgs),
+            "last_seq":           last_seq,
+            "has_more_older":     has_more,
+            "parent_read_up_to":  read_up_to,
+            "server_time":        _utc_now_iso(),
+        }), 200
+    except Exception as e:
+        logger.exception("Erreur parent_conversation")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/parent/send_message', methods=['POST'])
+def parent_send_message():
+    """Un parent écrit à l'école au sujet d'un élève. `client_id` (généré
+    par l'app) rend l'envoi IDEMPOTENT : si la réponse se perd et que
+    l'app réessaie, le message n'est jamais créé en double."""
+    try:
+        data        = request.get_json(silent=True) or {}
+        school_code = (data.get('school_code') or '').strip()
+        student_id  = (data.get('student_id') or '').strip().upper()
+        text        = (data.get('text') or '').strip()
+        client_id   = (data.get('client_id') or '').strip()[:80] or None
+        sender_name = (data.get('sender_name') or '').strip()[:60]
+
+        if not school_code or not student_id:
+            return jsonify({"error": "Paramètres manquants"}), 400
+        if not text:
+            return jsonify({"error": "Message vide"}), 400
+        if len(text) > MAX_MESSAGE_LENGTH:
+            return jsonify({"error": f"Message trop long (max {MAX_MESSAGE_LENGTH} caractères)"}), 413
+
+        student = _school_students_map(school_code).get(student_id)
+        if student is None:
+            return jsonify({"error": "Élève introuvable"}), 404
+
+        # anti-spam : max PARENT_RATE_LIMIT messages / minute / élève
+        store   = _load_json(MESSAGES_FILE, {})
+        recent  = _student_messages(store.get(school_code.lower(), []), student_id)
+        cutoff  = (datetime.datetime.now(datetime.timezone.utc)
+                   - datetime.timedelta(minutes=1)).isoformat()
+        nb_recent = sum(1 for m in recent
+                        if _sender_of(m) == 'parent'
+                        and (m.get('created_at') or '') >= cutoff
+                        and (m.get('created_at') or '').endswith('+00:00'))
+        if nb_recent >= PARENT_RATE_LIMIT:
+            return jsonify({"error": "Trop de messages, réessayez dans une minute."}), 429
+
+        nom = f"{student.get('nom','')} {student.get('postNom','')}".strip()
+        extra = {"nom_eleve": nom, "classe": student.get('classe', '')}
+        if sender_name:
+            extra["sender_name"] = sender_name
+        res = _add_messages_bulk(school_code, [{
+            "student_id": student_id, "type": "message", "title": "",
+            "message": text, "sender": "parent", "client_id": client_id,
+            "extra": extra,
+        }])
+        entry, created = res[0]
+
+        if created:
+            _run_async(_notify_school_of_parent_message, school_code, entry, nom or student_id)
+
+        return jsonify({"message": _public_message(entry),
+                        "deduplicated": not created}), 200
+    except Exception as e:
+        logger.exception("Erreur parent_send_message")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/parent/mark_conversation_read', methods=['POST'])
+def parent_mark_conversation_read():
+    """Le parent a ouvert la conversation : tous les messages de l'école
+    (jusqu'à up_to_seq si fourni) passent à « lu » → le badge disparaît."""
+    try:
+        data        = request.get_json(silent=True) or {}
+        school_code = (data.get('school_code') or '').strip()
+        student_id  = (data.get('student_id') or '').strip().upper()
+        try:
+            up_to = int(data.get('up_to_seq') or 0)
+        except (TypeError, ValueError):
+            up_to = 0
+        if not school_code or not student_id:
+            return jsonify({"error": "Données manquantes"}), 400
+
+        marked = 0
+        with _messages_lock():
+            store      = _load_json(MESSAGES_FILE, {})
+            school_key = school_code.lower()
+            msg_list   = store.get(school_key, [])
+            now_iso    = _utc_now_iso()
+            for m in msg_list:
+                if ((m.get('student_id') or '').upper() == student_id
+                        and _sender_of(m) != 'parent' and not m.get('read')
+                        and (up_to <= 0 or (m.get('seq') or 0) <= up_to)):
+                    m['read'] = True
+                    m['read_at'] = now_iso
+                    marked += 1
+            if marked:
+                store[school_key] = msg_list
+                _save_json_atomic(MESSAGES_FILE, store)
+            remaining = _unread_for_parent(_student_messages(msg_list, student_id))
+
+        return jsonify({"marked": marked, "unread_count": remaining}), 200
+    except Exception as e:
+        logger.exception("Erreur parent_mark_conversation_read")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/parent/conversations_summary', methods=['POST'])
+def parent_conversations_summary():
+    """Page d'accueil de l'app : pour CHAQUE enfant suivi → nombre de non-lus
+    (badge), dernier message (aperçu) et son horodatage. Un seul appel."""
+    try:
+        data     = request.get_json(silent=True) or {}
+        children = _clean_children(data.get('children'))
+        store    = _load_json(MESSAGES_FILE, {})
+        summaries, total = [], 0
+        for c in children:
+            msgs = _student_messages(store.get(c['school_code'], []), c['student_id'])
+            unread = _unread_for_parent(msgs)
+            total += unread
+            last = max(msgs, key=lambda m: m.get('seq') or 0) if msgs else None
+            summaries.append({
+                "school_code":  c['school_code'],
+                "student_id":   c['student_id'],
+                "unread_count": unread,
+                "last_seq":     (last.get('seq') or 0) if last else 0,
+                "last_message": ({
+                    "type":       last.get('type', 'message'),
+                    "title":      last.get('title', ''),
+                    "text":       _preview(last.get('message'), 120),
+                    "sender":     _sender_of(last),
+                    "created_at": last.get('created_at', ''),
+                } if last else None),
+            })
+        return jsonify({"summaries": summaries, "total_unread": total}), 200
+    except Exception as e:
+        logger.exception("Erreur parent_conversations_summary")
+        return jsonify({"error": str(e)}), 500
+
+
+# --------------------------------------------------------------------
+# CÔTÉ ÉCOLE — voir les messages des parents et leur répondre
+# (à brancher dans l'application école/promoteur)
+# --------------------------------------------------------------------
+
+@app.route('/school/get_conversations', methods=['GET'])
+def school_get_conversations():
+    """Liste des conversations de l'école (une par élève), la plus récente
+    en premier, avec le nombre de messages de parents NON LUS."""
+    try:
+        school_code = request.args.get('school_code', '').strip()
+        if not school_code:
+            return jsonify({"error": "Code manquant"}), 400
+        store    = _load_json(MESSAGES_FILE, {})
+        msg_list = store.get(school_code.lower(), [])
+        students = _school_students_map(school_code)
+
+        grouped = {}
+        for m in msg_list:
+            grouped.setdefault((m.get('student_id') or '').upper(), []).append(m)
+
+        convs, total_unread = [], 0
+        for sid, msgs in grouped.items():
+            if not sid:
+                continue
+            last   = max(msgs, key=lambda m: m.get('seq') or 0)
+            unread = _unread_for_school(msgs)
+            total_unread += unread
+            stu = students.get(sid, {})
+            nom = (f"{stu.get('nom','')} {stu.get('postNom','')} {stu.get('prenom','')}".strip()
+                   or last.get('nom_eleve') or sid)
+            convs.append({
+                "student_id":    sid,
+                "nom_eleve":     nom,
+                "classe":        stu.get('classe') or last.get('classe', ''),
+                "section":       stu.get('section', ''),
+                "unread_count":  unread,
+                "has_parent_message": any(_sender_of(m) == 'parent' for m in msgs),
+                "last_seq":      last.get('seq') or 0,
+                "last_message": {
+                    "type":       last.get('type', 'message'),
+                    "title":      last.get('title', ''),
+                    "text":       _preview(last.get('message'), 120),
+                    "sender":     _sender_of(last),
+                    "created_at": last.get('created_at', ''),
+                },
+            })
+        convs.sort(key=lambda c: c['last_seq'], reverse=True)
+        return jsonify({"conversations": convs, "total_unread": total_unread}), 200
+    except Exception as e:
+        logger.exception("Erreur school_get_conversations")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/school/get_conversation', methods=['GET'])
+def school_get_conversation():
+    try:
+        school_code = request.args.get('school_code', '').strip()
+        student_id  = request.args.get('student_id', '').strip().upper()
+        if not school_code or not student_id:
+            return jsonify({"error": "Paramètres manquants"}), 400
+        after_seq  = _int_arg('after_seq')
+        before_seq = _int_arg('before_seq')
+        limit      = _int_arg('limit', 100, 1, 500)
+
+        store = _load_json(MESSAGES_FILE, {})
+        msgs  = _student_messages(store.get(school_code.lower(), []), student_id)
+        window, has_more = _slice_conversation(msgs, after_seq, before_seq, limit)
+        return jsonify({
+            "messages":       [_public_message(m) for m in window],
+            "unread_count":   _unread_for_school(msgs),
+            "last_seq":       max((m.get('seq') or 0 for m in msgs), default=0),
+            "has_more_older": has_more,
+        }), 200
+    except Exception as e:
+        logger.exception("Erreur school_get_conversation")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/school/reply_message', methods=['POST'])
+def school_reply_message():
+    """L'école écrit librement au parent d'un élève (réponse ou message
+    spontané). Le parent reçoit une notification push."""
+    try:
+        data        = request.get_json(silent=True) or {}
+        school_code = (data.get('school_code') or '').strip()
+        student_id  = (data.get('student_id') or '').strip().upper()
+        text        = (data.get('text') or '').strip()
+        client_id   = (data.get('client_id') or '').strip()[:80] or None
+        sender_name = (data.get('sender_name') or '').strip()[:60]
+        title       = (data.get('title') or "Message de l'école").strip()[:80]
+        if not school_code or not student_id or not text:
+            return jsonify({"error": "Données manquantes"}), 400
+        if len(text) > MAX_MESSAGE_LENGTH:
+            return jsonify({"error": f"Message trop long (max {MAX_MESSAGE_LENGTH} caractères)"}), 413
+
+        stu = _school_students_map(school_code).get(student_id)
+        if stu is None:
+            return jsonify({"error": "Élève introuvable"}), 404
+        extra = {"nom_eleve": f"{stu.get('nom','')} {stu.get('postNom','')}".strip(),
+                 "classe": stu.get('classe', '')}
+        if sender_name:
+            extra["sender_name"] = sender_name
+        res = _add_messages_bulk(school_code, [{
+            "student_id": student_id, "type": "message", "title": title,
+            "message": text, "sender": "school", "client_id": client_id,
+            "extra": extra,
+        }])
+        entry, created = res[0]
+        if created:
+            _run_async(notify_parents_of_messages, school_code, [entry])
+        return jsonify({"message": _public_message(entry),
+                        "deduplicated": not created}), 200
+    except Exception as e:
+        logger.exception("Erreur school_reply_message")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/school/mark_conversation_read', methods=['POST'])
+def school_mark_conversation_read():
+    """L'école a ouvert la conversation : les messages du parent passent
+    à « lu » (le parent voit alors ✓✓ bleus)."""
+    try:
+        data        = request.get_json(silent=True) or {}
+        school_code = (data.get('school_code') or '').strip()
+        student_id  = (data.get('student_id') or '').strip().upper()
+        if not school_code or not student_id:
+            return jsonify({"error": "Données manquantes"}), 400
+        marked = 0
+        with _messages_lock():
+            store      = _load_json(MESSAGES_FILE, {})
+            school_key = school_code.lower()
+            msg_list   = store.get(school_key, [])
+            now_iso    = _utc_now_iso()
+            for m in msg_list:
+                if ((m.get('student_id') or '').upper() == student_id
+                        and _sender_of(m) == 'parent' and not m.get('read')):
+                    m['read'] = True
+                    m['read_at'] = now_iso
+                    marked += 1
+            if marked:
+                store[school_key] = msg_list
+                _save_json_atomic(MESSAGES_FILE, store)
+        return jsonify({"marked": marked}), 200
+    except Exception as e:
+        logger.exception("Erreur school_mark_conversation_read")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/admin/test_parent_push', methods=['POST'])
+def admin_test_parent_push():
+    """Outil de diagnostic : envoie une notification de test aux téléphones
+    enregistrés pour un élève. Corps : admin_password, school_code, student_id."""
+    try:
+        data = request.get_json(silent=True) or {}
+        if data.get('admin_password') != ADMIN_PASSWORD:
+            return jsonify({"error": "Accès refusé"}), 401
+        school_code = (data.get('school_code') or '').strip()
+        student_id  = (data.get('student_id') or '').strip().upper()
+        devices = _load_json(PARENT_DEVICES_FILE, {})
+        nb = sum(1 for d in devices.values()
+                 for c in d.get('children', [])
+                 if c.get('school_code', '').lower() == school_code.lower()
+                 and c.get('student_id', '').upper() == student_id)
+        if not _firebase_ready():
+            return jsonify({"error": "Firebase non initialisé (FIREBASE_SERVICE_ACCOUNT)",
+                            "devices_for_student": nb}), 503
+        if nb == 0:
+            return jsonify({"error": "Aucun téléphone enregistré pour cet élève. "
+                                     "Ouvrez l'app parent (avec internet) puis réessayez.",
+                            "devices_for_student": 0}), 404
+        fake = {"id": "test", "type": "announcement", "student_id": student_id,
+                "title": "Test de notification",
+                "message": "Si vous lisez ceci, les notifications fonctionnent ✅"}
+        notify_parents_of_messages(school_code, [fake])
+        return jsonify({"message": "Notification de test envoyée",
+                        "devices_for_student": nb}), 200
+    except Exception as e:
+        logger.exception("Erreur admin_test_parent_push")
+        return jsonify({"error": str(e)}), 500
+
+
+_migrate_messages_store()
 
 
 # ====================================================================
@@ -2927,6 +3730,7 @@ def admin_health():
             "ecoles":          details,
             "subscription_mode": "TEST (1 minute)" if SUBSCRIPTION_TEST_MODE else "PRODUCTION (30 jours)",
             "firebase_ready":  _firebase_ready(),
+            "parent_devices":  len(_load_json(PARENT_DEVICES_FILE, {})),
         }), 200
     except Exception as e:
         logger.exception("Erreur admin_health")
