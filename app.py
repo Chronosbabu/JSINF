@@ -17,6 +17,10 @@ except ImportError:          # Windows (dev local) : pas de verrou inter-process
     fcntl = None
 import firebase_admin
 from firebase_admin import credentials, messaging
+# ⚡ SYNC PAIEMENTS — synchronisation silencieuse des paiements école → parents
+from payment_sync import (
+    register_payment_sync, get_payment_version, bump_payment_versions,
+)
 
 app = Flask(__name__)
 
@@ -69,6 +73,7 @@ SYSTEM_FILES = {
     'promoter_resolved_requests.json',
     'fcm_tokens.json',
     'parent_devices.json',
+    'payments_versions.json',   # ⚡ SYNC PAIEMENTS
 }
 
 logging.basicConfig(
@@ -1250,6 +1255,8 @@ def validate_payments():
                 'validated':    True,
             })
             validated_count += 1
+            # ⚡ SYNC PAIEMENTS — le parent rechargera ses montants
+            bump_payment_versions(school_code, [entry.get('eleve_id')])
 
         with open(filepath, 'w', encoding='utf-8') as f:
             json.dump(saved, f, ensure_ascii=False, indent=2)
@@ -1619,6 +1626,8 @@ def confirm_mobile_payments():
                 'validated':   True,
             })
             confirmed_count += 1
+            # ⚡ SYNC PAIEMENTS — le parent rechargera ses montants
+            bump_payment_versions(school_code, [entry.get('eleve_id')])
 
         with open(filepath, 'w', encoding='utf-8') as f:
             json.dump(saved, f, ensure_ascii=False, indent=2)
@@ -1702,6 +1711,8 @@ def _auto_confirm_payment(eleve_id, mois, amount, network, tx_ref=''):
             })
             with open(fpath, 'w', encoding='utf-8') as f:
                 json.dump(saved, f, ensure_ascii=False, indent=2)
+            # ⚡ SYNC PAIEMENTS — le parent rechargera ses montants
+            bump_payment_versions(fname[:-5], [e.get('id')])
             return
 
 
@@ -3426,6 +3437,8 @@ def parent_conversation():
             "has_more_older":     has_more,
             "parent_read_up_to":  read_up_to,
             "server_time":        _utc_now_iso(),
+            # ⚡ SYNC PAIEMENTS — version des paiements de l'élève
+            "payments_version":   get_payment_version(school_code, student_id),
         }), 200
     except Exception as e:
         logger.exception("Erreur parent_conversation")
@@ -4299,6 +4312,14 @@ def admin_download_data_file():
         logger.exception("Erreur admin_download_data_file")
         return jsonify({"error": str(e)}), 500
 
+
+# ⚡ SYNC PAIEMENTS — route /school/sync_student_payments
+register_payment_sync(app, {
+    "add_messages_bulk":  _add_messages_bulk,
+    "run_async":          _run_async,
+    "notify_parents":     notify_parents_of_messages,
+    "get_all_ids_except": _get_all_ids_except,
+})
 
 _sync_orphan_schools()
 
