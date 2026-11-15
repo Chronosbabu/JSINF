@@ -9,8 +9,11 @@ import string
 import logging
 import sys
 import hashlib
+import hmac
+import shutil
 import threading
-import contextlib
+import unicodedata
+import functools
 try:
     import fcntl
 except ImportError:          # Windows (dev local) : pas de verrou inter-processus
@@ -43,7 +46,39 @@ PROMOTER_RESOLVED_REQUESTS_FILE = os.path.join(DATA_DIR, "promoter_resolved_requ
 FCM_TOKENS_FILE             = os.path.join(DATA_DIR, "fcm_tokens.json")
 PARENT_DEVICES_FILE         = os.path.join(DATA_DIR, "parent_devices.json")
 
-ADMIN_PASSWORD = "edupay_admin_2026"
+# Dossier de l'HISTORIQUE des sauvegardes (un sous-dossier par école).
+# Ce dossier n'est pas un fichier .json : il n'apparaît donc dans aucune
+# des listes de fichiers écoles du serveur.
+BACKUPS_DIR = os.path.join(DATA_DIR, "backups")
+
+# ====================================================================
+# ⚡ RÉGLAGES DE SÉCURITÉ (variables d'environnement Render)
+# --------------------------------------------------------------------
+# ADMIN_PASSWORD          : mot de passe admin (METTEZ-LE dans Render ;
+#                           la valeur ci-dessous n'est qu'un secours).
+# STRICT_AUTH=1           : à activer QUAND l'application sera mise à jour :
+#                           /restore exigera alors le mot de passe, et
+#                           /backup refusera les écoles inconnues.
+# REQUIRE_BASE_REVISION=1 : à activer QUAND l'application enverra
+#                           "base_revision" : /backup refusera alors toute
+#                           sauvegarde qui n'indique pas la révision.
+# BACKUP_GUARD_RATIO=0.7  : une sauvegarde qui contient moins de 70 % des
+#                           élèves / paiements du serveur est refusée.
+# MAX_SNAPSHOTS=40        : nombre de versions gardées par école.
+# WEBHOOK_SECRET          : secret optionnel pour les webhooks Mobile Money.
+# ====================================================================
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "edupay_admin_2026")
+STRICT_AUTH = os.environ.get("STRICT_AUTH", "0") == "1"
+REQUIRE_BASE_REVISION = os.environ.get("REQUIRE_BASE_REVISION", "0") == "1"
+try:
+    GUARD_RATIO = float(os.environ.get("BACKUP_GUARD_RATIO", "0.7"))
+except ValueError:
+    GUARD_RATIO = 0.7
+try:
+    MAX_SNAPSHOTS = max(5, int(os.environ.get("MAX_SNAPSHOTS", "40")))
+except ValueError:
+    MAX_SNAPSHOTS = 40
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 
 AIRTEL_MERCHANT_ID  = os.environ.get('AIRTEL_MERCHANT_ID', '')
 AIRTEL_API_KEY      = os.environ.get('AIRTEL_API_KEY', '')
@@ -86,6 +121,312 @@ logger = logging.getLogger("edupay")
 
 
 # ====================================================================
+# ⚡ VERROUS (threads + processus gunicorn)
+# --------------------------------------------------------------------
+# Avant : seule la messagerie avait un verrou. Les routes qui lisent puis
+# réécrivent le fichier d'une école (/backup, validations, webhooks...)
+# pouvaient s'écraser mutuellement. Maintenant TOUTES les écritures de
+# données passent par _DATA_LOCK. Le verrou est "réentrant" : une fonction
+# qui le tient peut en appeler une autre qui le prend aussi, sans blocage.
+# ====================================================================
+
+class _ReentrantFileLock:
+    def __init__(self, path):
+        self.path = path
+        self._tl = threading.RLock()
+        self._depth = 0
+        self._fd = None
+
+    def __enter__(self):
+        self._tl.acquire()
+        try:
+            if self._depth == 0 and fcntl is not None:
+                self._fd = open(self.path, 'a')
+                fcntl.flock(self._fd, fcntl.LOCK_EX)
+            self._depth += 1
+        except Exception:
+            self._tl.release()
+            raise
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            self._depth -= 1
+            if self._depth == 0 and self._fd is not None:
+                try:
+                    fcntl.flock(self._fd, fcntl.LOCK_UN)
+                finally:
+                    self._fd.close()
+                    self._fd = None
+        finally:
+            self._tl.release()
+        return False
+
+
+_DATA_LOCK = _ReentrantFileLock(os.path.join(DATA_DIR, "data.lock"))
+_MSG_LOCK = _ReentrantFileLock(os.path.join(DATA_DIR, "parent_messages.lock"))
+
+
+def _messages_lock():
+    """Verrou de la messagerie (conserve l'ancien nom)."""
+    return _MSG_LOCK
+
+
+def _locked(fn):
+    """Décorateur : toute la route s'exécute sous _DATA_LOCK."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _DATA_LOCK:
+            return fn(*args, **kwargs)
+    return wrapper
+
+
+# ====================================================================
+# FICHIERS JSON — lecture / écriture ATOMIQUE
+# ====================================================================
+
+def _load_json(path, default):
+    if os.path.exists(path):
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return default
+
+
+def _save_json_atomic(path, data):
+    """Écriture atomique : le fichier n'est jamais à moitié écrit, même si
+    le serveur redémarre au milieu d'une sauvegarde."""
+    tmp = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        raise
+
+
+def _save_json(path, data):
+    """Toutes les écritures du serveur sont désormais atomiques."""
+    _save_json_atomic(path, data)
+
+
+# ====================================================================
+# ⚡ CODE ÉCOLE → CHEMIN DE FICHIER (sécurisé)
+# --------------------------------------------------------------------
+# Avant : le code école servait directement de nom de fichier. Avec
+# "schools_registry" ou "../autre", on pouvait écraser un fichier système
+# ou sortir du dossier de données. Maintenant le code doit ne contenir que
+# lettres, chiffres, "-" et "_", et ne doit pas être un nom de fichier
+# système. Un code invalide donne un chemin qui n'existe jamais (les
+# routes répondent alors "École introuvable").
+# ====================================================================
+
+_SCHOOL_CODE_RE = re.compile(r'^[\w-]{1,40}$')
+_INVALID_SCHOOL_PATH = os.path.join(DATA_DIR, "__invalid_school_code__.json")
+
+
+def _valid_school_code(code):
+    code = (code or '').strip()
+    return bool(_SCHOOL_CODE_RE.match(code)) and \
+        f"{code.lower()}.json" not in SYSTEM_FILES
+
+
+def _school_path(code):
+    code = (code or '').strip()
+    if not _valid_school_code(code):
+        return _INVALID_SCHOOL_PATH
+    return os.path.join(DATA_DIR, f"{code.lower()}.json")
+
+
+def _pw_equal(a, b):
+    try:
+        return hmac.compare_digest(str(a).encode('utf-8'), str(b).encode('utf-8'))
+    except Exception:
+        return False
+
+
+# ====================================================================
+# ⚡ HISTORIQUE DES SAUVEGARDES (instantanés)
+# --------------------------------------------------------------------
+# Avant chaque écriture importante du fichier d'une école, l'ancienne
+# version est copiée dans backups/<ecole>/<date>.json (les MAX_SNAPSHOTS
+# dernières sont gardées). Plus aucune perte définitive possible.
+# ====================================================================
+
+def _backup_dir_for(filepath):
+    return os.path.join(BACKUPS_DIR, os.path.basename(filepath)[:-5])
+
+
+def _list_snapshots(filepath):
+    bdir = _backup_dir_for(filepath)
+    if not os.path.isdir(bdir):
+        return []
+    return sorted(f for f in os.listdir(bdir) if f.endswith('.json'))
+
+
+def _snapshot_before_write(filepath, min_interval_sec=0):
+    """Copie l'ancien fichier dans l'historique. min_interval_sec > 0 :
+    pas de nouvelle copie si la dernière date de moins de N secondes
+    (utilisé pour les modifications automatiques du serveur)."""
+    try:
+        if not os.path.exists(filepath):
+            return None
+        bdir = _backup_dir_for(filepath)
+        os.makedirs(bdir, exist_ok=True)
+        existing = _list_snapshots(filepath)
+        if min_interval_sec and existing:
+            last_path = os.path.join(bdir, existing[-1])
+            if time.time() - os.path.getmtime(last_path) < min_interval_sec:
+                return None
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        dest = os.path.join(bdir, f"{ts}.json")
+        shutil.copyfile(filepath, dest)
+        for old in _list_snapshots(filepath)[:-MAX_SNAPSHOTS]:
+            try:
+                os.remove(os.path.join(bdir, old))
+            except Exception:
+                pass
+        return dest
+    except Exception:
+        logger.exception("Instantané avant écriture : échec (non bloquant)")
+        return None
+
+
+def _read_school_json(filepath):
+    """Lit le fichier d'une école. Si le fichier est corrompu, tente la
+    dernière version valide de l'historique. Retourne None si impossible."""
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        logger.error("Fichier école corrompu '%s' : %s", filepath, e)
+        for name in reversed(_list_snapshots(filepath)):
+            try:
+                with open(os.path.join(_backup_dir_for(filepath), name),
+                          'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                logger.warning(
+                    "🩹 Lecture de secours depuis l'instantané '%s'", name)
+                return data
+            except Exception:
+                continue
+        return None
+    except Exception:
+        logger.exception("Lecture fichier école impossible : %s", filepath)
+        return None
+
+
+def _open_school(school_code):
+    """Retourne (filepath, data, erreur). erreur = (réponse, code) ou None."""
+    filepath = _school_path(school_code)
+    if not os.path.exists(filepath):
+        return None, None, (jsonify({"error": "École introuvable"}), 404)
+    saved = _read_school_json(filepath)
+    if saved is None:
+        return None, None, (jsonify({
+            "error": "Fichier école illisible (aucune version de secours)"
+        }), 500)
+    return filepath, saved, None
+
+
+def _school_revision(data):
+    try:
+        return int((data or {}).get('_revision') or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _commit_school(filepath, saved, snapshot_interval=600):
+    """Écrit le fichier d'une école modifié PAR LE SERVEUR (validation de
+    paiement, inscription...) : révision +1, instantané (limité dans le
+    temps) puis écriture atomique. L'appelant doit tenir _DATA_LOCK."""
+    saved['_revision'] = _school_revision(saved) + 1
+    saved['_saved_at'] = datetime.datetime.now().isoformat()
+    _snapshot_before_write(filepath, snapshot_interval)
+    _save_json(filepath, saved)
+
+
+def _collect_ids(data):
+    ids = set()
+    if not isinstance(data, dict):
+        return ids
+    for yd in (data.get('history') or {}).values():
+        for e in (yd or {}).get('eleves', []) or []:
+            if isinstance(e, dict) and e.get('id'):
+                ids.add(e['id'])
+    arch = data.get('elevesSupprimesData')
+    if isinstance(arch, dict):
+        for e in arch.get('eleves', []) or []:
+            if isinstance(e, dict) and e.get('id'):
+                ids.add(e['id'])
+    return ids
+
+
+def _school_stats(data):
+    students = 0
+    txs = 0
+    paid_total = 0.0
+    for yd in ((data or {}).get('history') or {}).values():
+        for e in (yd or {}).get('eleves', []) or []:
+            if not isinstance(e, dict):
+                continue
+            students += 1
+            txs += len(e.get('transactions') or [])
+            paid = e.get('paid') or {}
+            if isinstance(paid, dict):
+                for v in paid.values():
+                    try:
+                        paid_total += float(v or 0)
+                    except (TypeError, ValueError):
+                        pass
+    afr = 0
+    for lst in ((data or {}).get('autresFraisPaiementsByYear') or {}).values():
+        afr += len(lst or [])
+    return {"students": students, "transactions": txs,
+            "paid_total": paid_total, "autres_frais_paiements": afr}
+
+
+def _detect_data_loss(old, new):
+    """Compare l'état du serveur (old) à la sauvegarde reçue (new).
+    Retourne la liste des problèmes (vide = tout va bien). Empêche qu'un PC
+    vide, ou très en retard, remplace des données bien plus riches."""
+    problems = []
+    o = _school_stats(old)
+    n = _school_stats(new)
+    if o["students"] > 0 and n["students"] == 0:
+        problems.append(
+            f"la sauvegarde ne contient AUCUN élève alors que le serveur "
+            f"en a {o['students']}")
+    elif o["students"] >= 5 and n["students"] < o["students"] * GUARD_RATIO:
+        problems.append(
+            f"élèves : {n['students']} dans la sauvegarde contre "
+            f"{o['students']} sur le serveur")
+    if o["paid_total"] > 0 and n["paid_total"] < o["paid_total"] * GUARD_RATIO:
+        problems.append(
+            f"argent perçu : {n['paid_total']:.0f} dans la sauvegarde contre "
+            f"{o['paid_total']:.0f} sur le serveur")
+    if o["transactions"] >= 5 and \
+            n["transactions"] < o["transactions"] * GUARD_RATIO:
+        problems.append(
+            f"transactions : {n['transactions']} dans la sauvegarde contre "
+            f"{o['transactions']} sur le serveur")
+    if o["autres_frais_paiements"] >= 5 and \
+            n["autres_frais_paiements"] < o["autres_frais_paiements"] * GUARD_RATIO:
+        problems.append(
+            f"paiements autres frais : {n['autres_frais_paiements']} dans la "
+            f"sauvegarde contre {o['autres_frais_paiements']} sur le serveur")
+    return problems
+
+
+# ====================================================================
 # FIREBASE ADMIN SDK — initialisation et notifications FCM
 # ====================================================================
 
@@ -124,20 +465,8 @@ def _firebase_ready():
     return _firebase_app is not None
 
 
-def _load_json(path, default):
-    if os.path.exists(path):
-        with open(path, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return default
-
-
-def _save_json(path, data):
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
 # ====================================================================
-# ⚡ NOUVEAU — ANTI-DOUBLONS DE TRANSACTIONS
+# ⚡ ANTI-DOUBLONS DE TRANSACTIONS
 # ====================================================================
 # Cause du bug "le montant se multiplie à chaque clic sur Récupérer" :
 # l'application fusionne les transactions locales et celles du serveur.
@@ -146,6 +475,11 @@ def _save_json(path, data):
 # récupération. Solution côté serveur : toute transaction sans 'id'
 # reçoit un id STABLE (déterministe : toujours le même pour la même
 # transaction du même élève), et les doublons exacts sont supprimés.
+#
+# NOTE : seules les transactions SANS id (anciennes données) sont
+# dédoublonnées par signature (date|mois|montant). Une transaction qui
+# possède un id n'est jamais supprimée, sauf si le MÊME id apparaît deux
+# fois.
 # ====================================================================
 
 def _tx_signature(t):
@@ -172,11 +506,11 @@ def _normalize_eleve_transactions(eleve, rebuild_paid=False):
     """Dédoublonne les transactions d'un élève et donne un id stable à
     celles qui n'en ont pas.
 
-    ⚡ CORRECTION : quand des doublons sont supprimés, on RETIRE seulement
-    leur montant de 'paid' (au lieu de reconstruire 'paid' depuis les
-    transactions, ce qui effaçait les anciens paiements sans transaction et
-    faisait baisser les totaux). La reconstruction complète n'est faite que
-    si rebuild_paid=True (route admin de réparation).
+    Quand des doublons sont supprimés, on RETIRE seulement leur montant de
+    'paid' (au lieu de reconstruire 'paid' depuis les transactions, ce qui
+    effaçait les anciens paiements sans transaction et faisait baisser les
+    totaux). La reconstruction complète n'est faite que si
+    rebuild_paid=True (route admin de réparation, à utiliser avec prudence).
     Retourne le nombre de doublons supprimés."""
     txs = eleve.get('transactions')
     if not isinstance(txs, list) or not txs:
@@ -280,10 +614,11 @@ def _store_promoter_summary(school_code, summary, notify=True):
     """Enregistre le résumé du promoteur en REMPLAÇANT entièrement l'ancien
     (aucune fusion : ce que le PC envoie est exactement ce que le promoteur
     voit). Utilisé par /backup et /school/push_promoter_summary."""
-    store = _load_json(PROMOTER_SUMMARY_FILE, {})
-    summary['updated_at'] = datetime.datetime.now().isoformat()
-    store[school_code.lower()] = summary
-    _save_json(PROMOTER_SUMMARY_FILE, store)
+    with _DATA_LOCK:
+        store = _load_json(PROMOTER_SUMMARY_FILE, {})
+        summary['updated_at'] = datetime.datetime.now().isoformat()
+        store[school_code.lower()] = summary
+        _save_json(PROMOTER_SUMMARY_FILE, store)
     logger.info("promoter_summary : école='%s' résumé remplacé", school_code)
 
     if notify:
@@ -313,23 +648,24 @@ def register_fcm_token(school_code, role, token, platform):
     if not school_code or not token:
         return False
 
-    store       = _load_json(FCM_TOKENS_FILE, {})
-    school_key  = _fcm_tokens_key(school_code)
-    tokens_list = store.get(school_key, [])
+    with _DATA_LOCK:
+        store       = _load_json(FCM_TOKENS_FILE, {})
+        school_key  = _fcm_tokens_key(school_code)
+        tokens_list = store.get(school_key, [])
 
-    now_iso = datetime.datetime.now().isoformat()
+        now_iso = datetime.datetime.now().isoformat()
 
-    tokens_list = [t for t in tokens_list if t.get('token') != token]
+        tokens_list = [t for t in tokens_list if t.get('token') != token]
 
-    tokens_list.append({
-        "token":        token,
-        "role":         role or "unknown",
-        "platform":     platform or "unknown",
-        "updated_at":   now_iso,
-    })
+        tokens_list.append({
+            "token":        token,
+            "role":         role or "unknown",
+            "platform":     platform or "unknown",
+            "updated_at":   now_iso,
+        })
 
-    store[school_key] = tokens_list
-    _save_json(FCM_TOKENS_FILE, store)
+        store[school_key] = tokens_list
+        _save_json(FCM_TOKENS_FILE, store)
 
     logger.info(
         "📱 register_fcm_token : école='%s' role='%s' plateforme='%s'",
@@ -353,15 +689,16 @@ def _get_tokens_for_role(school_code, role=None):
 def _remove_invalid_tokens(school_code, invalid_tokens):
     if not invalid_tokens:
         return
-    store       = _load_json(FCM_TOKENS_FILE, {})
-    school_key  = _fcm_tokens_key(school_code)
-    tokens_list = store.get(school_key, [])
-    before      = len(tokens_list)
-    tokens_list = [
-        t for t in tokens_list if t.get('token') not in invalid_tokens
-    ]
-    store[school_key] = tokens_list
-    _save_json(FCM_TOKENS_FILE, store)
+    with _DATA_LOCK:
+        store       = _load_json(FCM_TOKENS_FILE, {})
+        school_key  = _fcm_tokens_key(school_code)
+        tokens_list = store.get(school_key, [])
+        before      = len(tokens_list)
+        tokens_list = [
+            t for t in tokens_list if t.get('token') not in invalid_tokens
+        ]
+        store[school_key] = tokens_list
+        _save_json(FCM_TOKENS_FILE, store)
     removed = before - len(tokens_list)
     if removed:
         logger.info(
@@ -446,6 +783,17 @@ def _log_startup_state():
             "TEST" if SUBSCRIPTION_TEST_MODE else "PRODUCTION",
             SUBSCRIPTION_DURATION_SECONDS,
         )
+        logger.info(
+            "Sécurité : STRICT_AUTH=%s REQUIRE_BASE_REVISION=%s "
+            "GUARD_RATIO=%s MAX_SNAPSHOTS=%s",
+            STRICT_AUTH, REQUIRE_BASE_REVISION, GUARD_RATIO, MAX_SNAPSHOTS,
+        )
+        if not os.environ.get("ADMIN_PASSWORD"):
+            logger.warning(
+                "⚠️ ADMIN_PASSWORD n'est pas défini dans l'environnement : "
+                "le mot de passe admin par défaut du code est utilisé. "
+                "Définissez ADMIN_PASSWORD dans Render."
+            )
         if not school_files:
             logger.warning(
                 "⚠️ Aucun fichier école trouvé au démarrage. Vérifiez que "
@@ -467,12 +815,16 @@ def _generate_registration_id():
 
 
 def _generate_school_code(school_name):
-    words   = school_name.strip().upper().split()
-    base    = words[0][:8] if words else "SCHOOL"
+    words = school_name.strip().upper().split()
+    base  = words[0][:8] if words else "SCHOOL"
+    # ⚡ le code sert de nom de fichier : on retire accents et symboles
+    base = unicodedata.normalize('NFKD', base).encode('ascii', 'ignore').decode('ascii')
+    base = re.sub(r'[^A-Z0-9]', '', base) or "SCHOOL"
     schools = _load_json(SCHOOLS_FILE, {})
     code    = base
     counter = 1
-    while any(s.get('school_code') == code for s in schools.values()):
+    while any(s.get('school_code') == code for s in schools.values()) or \
+            not _valid_school_code(code):
         code    = f"{base}{counter}"
         counter += 1
     return code
@@ -519,6 +871,11 @@ def _resolve_id_conflicts(school_code, backup_data):
             old_id = e.get('id', '')
             if not old_id or old_id not in other_ids:
                 continue
+            # ⚡ le même élève présent dans plusieurs années garde le MÊME
+            # nouvel id (avant : un nouvel id différent par année).
+            if old_id in corrections:
+                e['id'] = corrections[old_id]
+                continue
             match = re.match(r'^(.*?)(\d+)$', old_id)
             base  = match.group(1) if match else old_id + '_'
             counter = 1
@@ -529,9 +886,19 @@ def _resolve_id_conflicts(school_code, backup_data):
             corrections[old_id] = new_id
             e['id'] = new_id
             all_used.add(new_id)
-            all_used.discard(old_id)
 
     if corrections:
+        # ⚡ on applique AUSSI la correction aux paiements « autres frais »
+        # et aux élèves archivés (avant : ces paiements devenaient orphelins).
+        for plist in (backup_data.get('autresFraisPaiementsByYear') or {}).values():
+            for p in plist or []:
+                if isinstance(p, dict) and p.get('eleveId') in corrections:
+                    p['eleveId'] = corrections[p['eleveId']]
+        arch = backup_data.get('elevesSupprimesData')
+        if isinstance(arch, dict):
+            for e in arch.get('eleves', []) or []:
+                if isinstance(e, dict) and e.get('id') in corrections:
+                    e['id'] = corrections[e['id']]
         logger.info(
             "Conflits d'ID résolus pour l'école '%s' : %s",
             school_code, corrections,
@@ -565,60 +932,57 @@ def _register_orphan_school_file(school_code, fpath=None):
     if not school_code:
         return False
 
-    schools = _load_json(SCHOOLS_FILE, {})
-    _, existing = _find_in_schools_dict(schools, school_code)
-    if existing is not None:
-        return False
+    with _DATA_LOCK:
+        schools = _load_json(SCHOOLS_FILE, {})
+        _, existing = _find_in_schools_dict(schools, school_code)
+        if existing is not None:
+            return False
 
-    if fpath is None:
-        fpath = os.path.join(DATA_DIR, f"{school_code.lower()}.json")
-    if not os.path.exists(fpath):
-        return False
+        if fpath is None:
+            fpath = _school_path(school_code)
+        if not os.path.exists(fpath):
+            return False
 
-    try:
-        with open(fpath, 'r', encoding='utf-8') as f:
-            school_data = json.load(f)
-    except Exception as e:
-        logger.error(
-            "_register_orphan_school_file : fichier illisible '%s' : %s",
-            fpath, e,
-        )
-        return False
+        school_data = _read_school_json(fpath)
+        if school_data is None:
+            logger.error(
+                "_register_orphan_school_file : fichier illisible '%s'", fpath)
+            return False
 
-    config = school_data.get('config', {})
-    reg_id = _generate_registration_id()
-    all_reg_ids = {s.get('registration_id') for s in schools.values()}
-    while reg_id in all_reg_ids:
+        config = school_data.get('config', {})
         reg_id = _generate_registration_id()
+        all_reg_ids = {s.get('registration_id') for s in schools.values()}
+        while reg_id in all_reg_ids:
+            reg_id = _generate_registration_id()
 
-    try:
-        mtime = datetime.datetime.fromtimestamp(
-            os.path.getmtime(fpath)).isoformat()
-    except Exception:
-        mtime = datetime.datetime.now().isoformat()
+        try:
+            mtime = datetime.datetime.fromtimestamp(
+                os.path.getmtime(fpath)).isoformat()
+        except Exception:
+            mtime = datetime.datetime.now().isoformat()
 
-    code_upper = school_code.strip().upper()
-    schools[code_upper] = {
-        "school_code":     code_upper,
-        "school_name":     config.get('schoolName', code_upper),
-        "city":            config.get('city', ''),
-        "address":         '',
-        "director":        config.get('director', ''),
-        "phone":           config.get('phone', ''),
-        "email":           config.get('email', ''),
-        "bank_name":       config.get('bankName', ''),
-        "bank_account":    config.get('bankAccount', ''),
-        "bank_branch":     config.get('bankBranch', ''),
-        "registration_id": reg_id,
-        "activated":       True,
-        "registered_at":   mtime,
-        "activated_at":    mtime,
-        "subscription_started_at": None,
-        "subscription_expires_at": None,
-        "subscription_blocked":    False,
-        "recovered":       True,
-    }
-    _save_json(SCHOOLS_FILE, schools)
+        code_upper = school_code.strip().upper()
+        schools[code_upper] = {
+            "school_code":     code_upper,
+            "school_name":     config.get('schoolName', code_upper),
+            "city":            config.get('city', ''),
+            "address":         '',
+            "director":        config.get('director', ''),
+            "phone":           config.get('phone', ''),
+            "email":           config.get('email', ''),
+            "bank_name":       config.get('bankName', ''),
+            "bank_account":    config.get('bankAccount', ''),
+            "bank_branch":     config.get('bankBranch', ''),
+            "registration_id": reg_id,
+            "activated":       True,
+            "registered_at":   mtime,
+            "activated_at":    mtime,
+            "subscription_started_at": None,
+            "subscription_expires_at": None,
+            "subscription_blocked":    False,
+            "recovered":       True,
+        }
+        _save_json(SCHOOLS_FILE, schools)
     logger.warning(
         "🩹 École orpheline réenregistrée automatiquement : code='%s' "
         "nom='%s' (source='%s')",
@@ -748,7 +1112,8 @@ def _distribute_payment(config, eleve, start_mois, total_amount):
 def _add_cors_headers(response):
     response.headers['Access-Control-Allow-Origin'] = '*'
     response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
-    response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+    response.headers['Access-Control-Allow-Headers'] = \
+        'Content-Type, X-Backup-Password, X-Webhook-Secret'
     response.headers['Access-Control-Max-Age'] = '86400'
     return response
 
@@ -759,8 +1124,8 @@ def _log_incoming_request():
         "→ %s %s | IP=%s",
         request.method, request.path, request.remote_addr,
     )
-    # ⚡ NOUVEAU — garantit que le robot des rappels urgents tourne dans
-    # CE processus (utile si gunicorn utilise --preload ou plusieurs workers).
+    # garantit que le robot des rappels urgents tourne dans CE processus
+    # (utile si gunicorn utilise --preload ou plusieurs workers).
     try:
         _ensure_reminder_worker()
     except Exception:
@@ -781,6 +1146,7 @@ def serve_parent_html_alias():
 
 
 @app.route('/admin/register_school', methods=['POST'])
+@_locked
 def admin_register_school():
     try:
         data = request.get_json()
@@ -912,6 +1278,7 @@ def get_info_by_reg_id():
 
 
 @app.route('/school/activate', methods=['POST'])
+@_locked
 def activate_school():
     try:
         data     = request.get_json()
@@ -940,7 +1307,7 @@ def activate_school():
 
         school_info = schools[target_code]
         final_name  = school_info.get('school_name', '')
-        filepath    = os.path.join(DATA_DIR, f"{target_code.lower()}.json")
+        filepath    = _school_path(target_code)
 
         if not os.path.exists(filepath):
             initial_data = {
@@ -968,9 +1335,9 @@ def activate_school():
                 "backup_password": password,
                 "autresFrais": [],
                 "autresFraisPaiementsByYear": {},
+                "_revision": 0,
             }
-            with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(initial_data, f, ensure_ascii=False, indent=2)
+            _save_json(filepath, initial_data)
         return jsonify({
             "message":     "Compte activé avec succès. Bienvenue sur EduPay !",
             "school_code": target_code,
@@ -984,6 +1351,7 @@ def activate_school():
 
 
 @app.route('/admin/list_schools', methods=['POST'])
+@_locked
 def list_schools():
     try:
         data = request.get_json()
@@ -1010,39 +1378,140 @@ def list_schools():
         return jsonify({"error": str(e)}), 500
 
 
+# ====================================================================
+# ⚡ SAUVEGARDE / RÉCUPÉRATION — le cœur de la protection des données
+# --------------------------------------------------------------------
+# /backup :
+#   1. code école validé (plus de fichier système écrasé) ;
+#   2. mot de passe vérifié (celui enregistré dans le fichier de l'école) ;
+#   3. verrou : une seule écriture à la fois ;
+#   4. numéro de révision : si l'application envoie "base_revision" et
+#      qu'il ne correspond pas à celui du serveur (quelqu'un a sauvegardé
+#      entre-temps) → 409, le PC doit d'abord récupérer et fusionner ;
+#   5. garde-fou : une sauvegarde qui contient bien moins d'élèves /
+#      d'argent / de transactions que le serveur est refusée (409) ;
+#      "force": true permet de passer outre, volontairement ;
+#   6. l'ancien fichier est copié dans backups/ AVANT d'être remplacé ;
+#   7. écriture atomique.
+# /restore : LECTURE SEULE (ne réécrit plus jamais le fichier).
+# ====================================================================
+
 @app.route('/backup', methods=['POST'])
 def backup():
     try:
-        data        = request.get_json()
-        school_code = data.get('school_code')
+        data        = request.get_json(silent=True) or {}
+        school_code = (data.get('school_code') or '').strip()
         backup_data = data.get('data')
-        if not school_code or not backup_data:
+        if not school_code or not isinstance(backup_data, dict) or not backup_data:
             return jsonify({"error": "Données invalides"}), 400
+        if not _valid_school_code(school_code):
+            return jsonify({
+                "error": "Code école invalide (lettres, chiffres, - et _ uniquement)"
+            }), 400
 
-        # ⚡ NOUVEAU — nettoyage des doublons de transactions avant stockage
-        removed = _normalize_school_data(backup_data)
-        if removed:
-            logger.warning(
-                "🧹 backup : école='%s' → %d transaction(s) en double "
-                "supprimée(s) avant enregistrement.", school_code, removed,
-            )
+        filepath         = _school_path(school_code)
+        force            = _as_bool(data.get('force', False))
+        base_revision    = data.get('base_revision')
+        given_password   = backup_data.get('backup_password')
+        current_password = data.get('current_password')
 
-        corrected_data, corrections = _resolve_id_conflicts(
-            school_code, backup_data)
+        with _DATA_LOCK:
+            existing = None
+            if os.path.exists(filepath):
+                existing = _read_school_json(filepath)
+                if existing is None and not force:
+                    return jsonify({
+                        "error": "Le fichier du serveur est illisible et aucune "
+                                 "version de secours n'a été trouvée. Rien n'a "
+                                 "été écrasé. Contactez l'administrateur.",
+                        "code": "SERVER_FILE_UNREADABLE",
+                    }), 500
 
-        filepath = os.path.join(DATA_DIR, f"{school_code.lower()}.json")
-        with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(corrected_data, f, ensure_ascii=False, indent=2)
+            # --- 1) authentification ---
+            if existing is None:
+                _, entry = _find_school_entry(school_code)
+                if entry is None and STRICT_AUTH:
+                    return jsonify({
+                        "error": "École non enregistrée sur le serveur."
+                    }), 403
+            else:
+                stored_pw = existing.get('backup_password')
+                if stored_pw:
+                    ok = _pw_equal(stored_pw, given_password) or (
+                        current_password and _pw_equal(stored_pw, current_password))
+                    if not ok:
+                        logger.warning(
+                            "backup refusé (mot de passe) : école='%s'", school_code)
+                        return jsonify({"error": "Mot de passe incorrect"}), 401
 
-        if _register_orphan_school_file(school_code, filepath):
-            logger.info(
-                "🩹 backup : école='%s' réintégrée au registre.",
-                school_code,
-            )
+            # --- 2) nettoyage des doublons ---
+            removed = _normalize_school_data(backup_data)
+            if removed:
+                logger.warning(
+                    "🧹 backup : école='%s' → %d transaction(s) en double "
+                    "supprimée(s) avant enregistrement.", school_code, removed,
+                )
 
-        # ⚡ NOUVEAU — le résumé promoteur arrive avec la sauvegarde et est
-        # enregistré dans la même requête (plus de 2ᵉ appel qui échoue en
-        # silence et laisse le promoteur sur d'anciennes données).
+            # --- 3) révision + garde-fou ---
+            server_rev = _school_revision(existing) if existing else 0
+            if existing is not None and not force:
+                if base_revision is not None:
+                    try:
+                        base_int = int(base_revision)
+                    except (TypeError, ValueError):
+                        base_int = -1
+                    if base_int != server_rev:
+                        logger.warning(
+                            "backup refusé (révision) : école='%s' base=%s serveur=%s",
+                            school_code, base_revision, server_rev)
+                        return jsonify({
+                            "error": "Le serveur contient une version plus récente "
+                                     "que celle de cet ordinateur. Cliquez d'abord "
+                                     "sur « Récupérer depuis le Serveur », puis "
+                                     "sauvegardez à nouveau.",
+                            "code": "STALE_REVISION",
+                            "server_revision": server_rev,
+                        }), 409
+                elif REQUIRE_BASE_REVISION:
+                    return jsonify({
+                        "error": "Votre application doit être mise à jour "
+                                 "(base_revision manquant).",
+                        "code": "BASE_REVISION_REQUIRED",
+                        "server_revision": server_rev,
+                    }), 409
+
+                problems = _detect_data_loss(existing, backup_data)
+                if problems:
+                    logger.warning(
+                        "backup refusé (perte de données) : école='%s' : %s",
+                        school_code, problems)
+                    return jsonify({
+                        "error": "Sauvegarde refusée pour protéger vos données : "
+                                 + " ; ".join(problems)
+                                 + ". Récupérez d'abord les données du serveur.",
+                        "code": "DATA_LOSS_GUARD",
+                        "server_revision": server_rev,
+                    }), 409
+
+            # --- 4) conflits d'ID entre écoles ---
+            corrected_data, corrections = _resolve_id_conflicts(
+                school_code, backup_data)
+
+            new_rev = server_rev + 1
+            corrected_data['_revision'] = new_rev
+            corrected_data['_saved_at'] = datetime.datetime.now().isoformat()
+
+            # --- 5) instantané PUIS écriture atomique ---
+            _snapshot_before_write(filepath)
+            _save_json(filepath, corrected_data)
+
+            if _register_orphan_school_file(school_code, filepath):
+                logger.info(
+                    "🩹 backup : école='%s' réintégrée au registre.",
+                    school_code,
+                )
+
+        # Résumé promoteur (hors du verrou : il envoie une notification).
         summary_saved = False
         promoter_summary = data.get('promoter_summary')
         if isinstance(promoter_summary, dict):
@@ -1058,6 +1527,7 @@ def backup():
             "school_code":   school_code,
             "corrections":   corrections,
             "summary_saved": summary_saved,
+            "revision":      new_rev,
             "subscription":  _compute_subscription_status(school_entry),
         }), 200
     except Exception as e:
@@ -1067,65 +1537,179 @@ def backup():
 
 @app.route('/restore', methods=['GET'])
 def restore():
-    school_code = request.args.get('school_code')
+    """LECTURE SEULE. Le mot de passe peut être donné dans l'en-tête
+    X-Backup-Password (ou ?password=). Avec STRICT_AUTH=1 il est exigé.
+    ?exists_only=1 : renvoie seulement le nom de l'école (vérification du code)."""
+    school_code = (request.args.get('school_code') or '').strip()
     if not school_code:
         return jsonify({"error": "Code manquant"}), 400
-    filepath = os.path.join(DATA_DIR, f"{school_code.lower()}.json")
-    if os.path.exists(filepath):
-        with open(filepath, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+    if not _valid_school_code(school_code):
+        return jsonify({"error": "Code école invalide"}), 400
 
-        # ⚡ NOUVEAU — on s'assure que toutes les transactions ont un id
-        # stable et qu'il n'y a aucun doublon : la récupération devient
-        # idempotente (cliquer 10 fois = même résultat que 1 fois).
-        removed = _normalize_school_data(data)
-        try:
-            _save_json(filepath, data)
-        except Exception:
-            logger.exception("restore : impossible de réécrire le fichier nettoyé")
-        if removed:
-            logger.warning(
-                "🧹 restore : école='%s' → %d doublon(s) supprimé(s).",
-                school_code, removed,
-            )
+    filepath = _school_path(school_code)
+    if not os.path.exists(filepath):
+        return jsonify({"error": "Aucune sauvegarde trouvée"}), 404
 
-        data.pop('backup_password', None)
-        _, school_entry = _find_school_entry(school_code)
-        data['subscription'] = _compute_subscription_status(school_entry)
-        return jsonify(data), 200
-    return jsonify({"error": "Aucune sauvegarde trouvée"}), 404
+    data = _read_school_json(filepath)
+    if data is None:
+        return jsonify({
+            "error": "Fichier du serveur illisible. Contactez l'administrateur."
+        }), 500
+
+    if _as_bool(request.args.get('exists_only', '0')):
+        return jsonify({
+            "config": {"schoolName": (data.get('config') or {}).get('schoolName', '')}
+        }), 200
+
+    stored_pw = data.get('backup_password')
+    given_pw = request.headers.get('X-Backup-Password')
+    if given_pw is None:
+        given_pw = request.args.get('password')
+    if given_pw is not None:
+        if stored_pw and not _pw_equal(stored_pw, given_pw):
+            return jsonify({"error": "Mot de passe incorrect"}), 401
+    elif STRICT_AUTH and stored_pw:
+        return jsonify({"error": "Mot de passe requis"}), 401
+
+    # Nettoyage EN MÉMOIRE seulement (le fichier du serveur n'est jamais
+    # réécrit ici : plus de course critique avec /backup).
+    removed = _normalize_school_data(data)
+    if removed:
+        logger.warning(
+            "🧹 restore : école='%s' → %d doublon(s) ignoré(s) dans la réponse.",
+            school_code, removed,
+        )
+
+    data.pop('backup_password', None)
+    _, school_entry = _find_school_entry(school_code)
+    data['subscription'] = _compute_subscription_status(school_entry)
+    data['revision'] = _school_revision(data)
+    return jsonify(data), 200
 
 
 @app.route('/admin/clean_duplicate_transactions', methods=['POST'])
 def admin_clean_duplicate_transactions():
-    """À appeler UNE FOIS pour réparer toutes les écoles déjà corrompues
-    (montants multipliés). Body JSON : {"admin_password": "..."}"""
+    """Répare les écoles dont les montants ont été multipliés. Body JSON :
+    {"admin_password": "...", "rebuild_paid": false}
+    ⚠️ rebuild_paid=true reconstruit 'paid' UNIQUEMENT depuis les
+    transactions et efface les anciens paiements sans historique : à ne
+    pas utiliser sans raison. Un instantané est fait avant chaque réparation."""
     try:
         data = request.get_json()
         if data.get('admin_password') != ADMIN_PASSWORD:
             return jsonify({"error": "Accès refusé"}), 401
 
+        rebuild_paid = _as_bool(data.get('rebuild_paid', False))
         report = []
-        for fname in sorted(os.listdir(DATA_DIR)):
-            if not fname.endswith('.json') or fname in SYSTEM_FILES:
-                continue
-            fpath = os.path.join(DATA_DIR, fname)
-            try:
-                with open(fpath, 'r', encoding='utf-8') as f:
-                    school_data = json.load(f)
-                removed = _normalize_school_data(school_data, rebuild_paid=True)
-                _save_json(fpath, school_data)
-                report.append({"fichier": fname, "doublons_supprimes": removed})
-            except Exception as e:
-                report.append({"fichier": fname, "erreur": str(e)})
+        with _DATA_LOCK:
+            for fname in sorted(os.listdir(DATA_DIR)):
+                if not fname.endswith('.json') or fname in SYSTEM_FILES:
+                    continue
+                fpath = os.path.join(DATA_DIR, fname)
+                try:
+                    school_data = _read_school_json(fpath)
+                    if school_data is None:
+                        report.append({"fichier": fname, "erreur": "illisible"})
+                        continue
+                    removed = _normalize_school_data(
+                        school_data, rebuild_paid=rebuild_paid)
+                    if removed:
+                        _commit_school(fpath, school_data, snapshot_interval=0)
+                    report.append({"fichier": fname, "doublons_supprimes": removed})
+                except Exception as e:
+                    report.append({"fichier": fname, "erreur": str(e)})
 
-        return jsonify({"rapport": report, "total_fichiers": len(report)}), 200
+        return jsonify({"rapport": report, "total_fichiers": len(report),
+                        "rebuild_paid": rebuild_paid}), 200
     except Exception as e:
         logger.exception("Erreur admin_clean_duplicate_transactions")
         return jsonify({"error": str(e)}), 500
 
 
+@app.route('/admin/list_backups', methods=['POST'])
+def admin_list_backups():
+    """Liste l'historique des versions d'une école (pour récupérer des
+    données perdues). Body : {"admin_password", "school_code"}."""
+    try:
+        data = request.get_json()
+        if data.get('admin_password') != ADMIN_PASSWORD:
+            return jsonify({"error": "Accès refusé"}), 401
+        school_code = (data.get('school_code') or '').strip()
+        if not _valid_school_code(school_code):
+            return jsonify({"error": "Code école invalide"}), 400
+        filepath = _school_path(school_code)
+        bdir = _backup_dir_for(filepath)
+        items = []
+        for name in reversed(_list_snapshots(filepath)):
+            fpath = os.path.join(bdir, name)
+            entry = {"filename": name, "size": os.path.getsize(fpath),
+                     "modified": datetime.datetime.fromtimestamp(
+                         os.path.getmtime(fpath)).isoformat()}
+            try:
+                with open(fpath, 'r', encoding='utf-8') as f:
+                    d = json.load(f)
+                entry.update(_school_stats(d))
+                entry["revision"] = _school_revision(d)
+            except Exception:
+                entry["erreur"] = "illisible"
+            items.append(entry)
+        current = _read_school_json(filepath) if os.path.exists(filepath) else None
+        return jsonify({
+            "school_code": school_code,
+            "current": ({**_school_stats(current),
+                         "revision": _school_revision(current)}
+                        if current else None),
+            "backups": items,
+            "total": len(items),
+        }), 200
+    except Exception as e:
+        logger.exception("Erreur admin_list_backups")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/admin/restore_backup', methods=['POST'])
+def admin_restore_backup():
+    """Remet en place une ancienne version d'une école. La version actuelle
+    est d'abord copiée dans l'historique (rien n'est perdu), et la révision
+    est augmentée : les PC en retard seront obligés de récupérer d'abord.
+    Body : {"admin_password", "school_code", "filename"}."""
+    try:
+        data = request.get_json()
+        if data.get('admin_password') != ADMIN_PASSWORD:
+            return jsonify({"error": "Accès refusé"}), 401
+        school_code = (data.get('school_code') or '').strip()
+        filename    = (data.get('filename') or '').strip()
+        if not _valid_school_code(school_code):
+            return jsonify({"error": "Code école invalide"}), 400
+        if os.path.basename(filename) != filename or not filename.endswith('.json'):
+            return jsonify({"error": "Nom de fichier invalide"}), 400
+
+        filepath = _school_path(school_code)
+        src = os.path.join(_backup_dir_for(filepath), filename)
+        if not os.path.exists(src):
+            return jsonify({"error": "Version introuvable"}), 404
+
+        with _DATA_LOCK:
+            with open(src, 'r', encoding='utf-8') as f:
+                snapshot_data = json.load(f)
+            current = _read_school_json(filepath) if os.path.exists(filepath) else None
+            _snapshot_before_write(filepath)
+            snapshot_data['_revision'] = _school_revision(current) + 1
+            snapshot_data['_saved_at'] = datetime.datetime.now().isoformat()
+            _save_json(filepath, snapshot_data)
+
+        logger.warning("♻️ restore_backup : école='%s' version='%s' remise en place",
+                       school_code, filename)
+        return jsonify({"message": "Version restaurée",
+                        "revision": snapshot_data['_revision'],
+                        **_school_stats(snapshot_data)}), 200
+    except Exception as e:
+        logger.exception("Erreur admin_restore_backup")
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/record_payment', methods=['POST'])
+@_locked
 def record_payment():
     try:
         data        = request.get_json()
@@ -1138,12 +1722,9 @@ def record_payment():
         if not all([school_code, annee, eleve_id, mois]) or amount is None:
             return jsonify({"error": "Données manquantes"}), 400
 
-        filepath = os.path.join(DATA_DIR, f"{school_code.lower()}.json")
-        if not os.path.exists(filepath):
-            return jsonify({"error": "École introuvable"}), 404
-
-        with open(filepath, 'r', encoding='utf-8') as f:
-            saved = json.load(f)
+        filepath, saved, err = _open_school(school_code)
+        if err:
+            return err
 
         year_data = saved.get('history', {}).get(annee)
         if not year_data:
@@ -1203,6 +1784,7 @@ def get_pending_payments():
 
 
 @app.route('/validate_payments', methods=['POST'])
+@_locked
 def validate_payments():
     try:
         data        = request.get_json()
@@ -1213,12 +1795,9 @@ def validate_payments():
             return jsonify({"error": "Code manquant"}), 400
 
         school_key = school_code.lower()
-        filepath   = os.path.join(DATA_DIR, f"{school_key}.json")
-        if not os.path.exists(filepath):
-            return jsonify({"error": "École introuvable"}), 404
-
-        with open(filepath, 'r', encoding='utf-8') as f:
-            saved = json.load(f)
+        filepath, saved, err = _open_school(school_code)
+        if err:
+            return err
         history = saved.get('history', {})
 
         pending_store = _load_json(PENDING_FILE, {})
@@ -1232,6 +1811,7 @@ def validate_payments():
             remaining   = []
 
         validated_count = 0
+        touched_ids = []
         for entry in to_validate:
             year_data = history.get(entry.get('annee'))
             if not year_data:
@@ -1245,7 +1825,7 @@ def validate_payments():
             eleve['paid'][entry['mois']] = (
                 eleve['paid'].get(entry['mois'], 0) + entry['amount'])
             eleve.setdefault('transactions', [])
-            # ⚡ NOUVEAU — id stable pour éviter tout doublon côté application
+            # id stable pour éviter tout doublon côté application
             eleve['transactions'].append({
                 'id':           f"SRV_{entry.get('id')}",
                 'date':         entry.get('date'),
@@ -1255,11 +1835,14 @@ def validate_payments():
                 'validated':    True,
             })
             validated_count += 1
-            # ⚡ SYNC PAIEMENTS — le parent rechargera ses montants
-            bump_payment_versions(school_code, [entry.get('eleve_id')])
+            touched_ids.append(entry.get('eleve_id'))
 
-        with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(saved, f, ensure_ascii=False, indent=2)
+        if validated_count:
+            # révision +1 : un PC qui n'a pas encore récupéré ces paiements
+            # sera obligé de récupérer avant de pouvoir sauvegarder.
+            _commit_school(filepath, saved)
+            # ⚡ SYNC PAIEMENTS — le parent rechargera ses montants
+            bump_payment_versions(school_code, touched_ids)
 
         pending_store[school_key] = remaining
         _save_json(PENDING_FILE, pending_store)
@@ -1275,6 +1858,7 @@ def validate_payments():
 
 
 @app.route('/reject_payment', methods=['POST'])
+@_locked
 def reject_payment():
     try:
         data        = request.get_json()
@@ -1309,8 +1893,13 @@ def payment_status():
 
 @app.route('/parent/find_student', methods=['GET'])
 def parent_find_student():
+    """Cherche un élève par son ID. ⚡ Paramètre optionnel school_code :
+    si deux écoles ont le même ID d'élève, il évite de renvoyer le mauvais
+    enfant. Sans lui, la réponse contient "matches_count" (nombre d'écoles
+    où cet ID existe)."""
     try:
-        student_id = request.args.get('student_id', '').strip().upper()
+        student_id  = request.args.get('student_id', '').strip().upper()
+        only_school = request.args.get('school_code', '').strip().lower()
         if not student_id:
             return jsonify({"found": False, "error": "ID manquant"}), 400
 
@@ -1318,13 +1907,17 @@ def parent_find_student():
             f for f in os.listdir(DATA_DIR)
             if f.endswith('.json') and f not in SYSTEM_FILES
         ]
+        if only_school:
+            fichiers_ecoles = [f for f in fichiers_ecoles
+                               if f == f"{only_school}.json"]
+
+        first_match = None
+        matches_count = 0
 
         for fname in fichiers_ecoles:
             fpath = os.path.join(DATA_DIR, fname)
-            try:
-                with open(fpath, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-            except Exception:
+            data = _read_school_json(fpath)
+            if data is None:
                 continue
 
             school_code  = fname.replace('.json', '').upper()
@@ -1332,29 +1925,45 @@ def parent_find_student():
             current_year = data.get('currentYear', '')
             config       = data.get('config', {})
 
+            found_here = None
             for yd in data.get('history', {}).values():
                 for e in yd.get('eleves', []):
                     if e.get('id', '').upper() == student_id:
-                        return jsonify({
-                            "found":   True,
-                            "student": {
-                                "id":      e.get('id'),
-                                "nom":     e.get('nom', ''),
-                                "postNom": e.get('postNom', ''),
-                                "prenom":  e.get('prenom', ''),
-                                "classe":  e.get('classe', ''),
-                                "section": e.get('section', ''),
-                            },
-                            "school_code":  school_code,
-                            "school_name":  school_name,
-                            "current_year": current_year,
-                            "config": {
-                                "feesBySection":
-                                    config.get('feesBySection', {}),
-                                "monthlyExceptionsBySection":
-                                    config.get('monthlyExceptionsBySection', {}),
-                            }
-                        }), 200
+                        found_here = e
+                        break
+                if found_here:
+                    break
+            if not found_here:
+                continue
+
+            matches_count += 1
+            if first_match is None:
+                first_match = {
+                    "found":   True,
+                    "student": {
+                        "id":      found_here.get('id'),
+                        "nom":     found_here.get('nom', ''),
+                        "postNom": found_here.get('postNom', ''),
+                        "prenom":  found_here.get('prenom', ''),
+                        "classe":  found_here.get('classe', ''),
+                        "section": found_here.get('section', ''),
+                    },
+                    "school_code":  school_code,
+                    "school_name":  school_name,
+                    "current_year": current_year,
+                    "config": {
+                        "feesBySection":
+                            config.get('feesBySection', {}),
+                        "monthlyExceptionsBySection":
+                            config.get('monthlyExceptionsBySection', {}),
+                    }
+                }
+            if only_school:
+                break
+
+        if first_match is not None:
+            first_match["matches_count"] = matches_count
+            return jsonify(first_match), 200
 
         return jsonify({
             "found": False,
@@ -1373,12 +1982,9 @@ def parent_get_payment_history():
         if not student_id or not school_code:
             return jsonify({"error": "Paramètres manquants"}), 400
 
-        filepath = os.path.join(DATA_DIR, f"{school_code.lower()}.json")
-        if not os.path.exists(filepath):
-            return jsonify({"error": "École introuvable"}), 404
-
-        with open(filepath, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+        filepath, data, err = _open_school(school_code)
+        if err:
+            return err
 
         config       = data.get('config', {})
         current_year = data.get('currentYear', '')
@@ -1413,12 +2019,9 @@ def parent_preview_payment():
         if not all([student_id, school_code, start_mois]) or amount <= 0:
             return jsonify({"error": "Données manquantes"}), 400
 
-        filepath = os.path.join(DATA_DIR, f"{school_code.lower()}.json")
-        if not os.path.exists(filepath):
-            return jsonify({"error": "École introuvable"}), 404
-
-        with open(filepath, 'r', encoding='utf-8') as f:
-            saved = json.load(f)
+        filepath, saved, err = _open_school(school_code)
+        if err:
+            return err
 
         config       = saved.get('config', {})
         current_year = saved.get('currentYear', '')
@@ -1467,75 +2070,77 @@ def _store_pending_mobile_payment(data):
         if not student_id or not school_code:
             return jsonify({"error": "Données manquantes"}), 400
 
-        filepath = os.path.join(DATA_DIR, f"{school_code.lower()}.json")
-        if not os.path.exists(filepath):
-            return jsonify({"error": "École introuvable"}), 404
+        with _DATA_LOCK:
+            filepath, saved, err = _open_school(school_code)
+            if err:
+                return err
 
-        with open(filepath, 'r', encoding='utf-8') as f:
-            saved = json.load(f)
+            config       = saved.get('config', {})
+            current_year = saved.get('currentYear', '')
+            year_data    = saved.get('history', {}).get(current_year, {})
 
-        config       = saved.get('config', {})
-        current_year = saved.get('currentYear', '')
-        year_data    = saved.get('history', {}).get(current_year, {})
+            eleve = next(
+                (e for e in year_data.get('eleves', [])
+                 if e.get('id', '').upper() == student_id), None)
+            if eleve is None:
+                return jsonify({"error": "Élève introuvable"}), 404
 
-        eleve = next(
-            (e for e in year_data.get('eleves', [])
-             if e.get('id', '').upper() == student_id), None)
-        if eleve is None:
-            return jsonify({"error": "Élève introuvable"}), 404
+            if not month_entries:
+                if not start_mois or not total_amount:
+                    return jsonify({"error": "Mois et montant requis"}), 400
+                month_entries = _distribute_payment(
+                    config, eleve, start_mois, float(total_amount))
 
-        if not month_entries:
-            if not start_mois or not total_amount:
-                return jsonify({"error": "Mois et montant requis"}), 400
-            month_entries = _distribute_payment(
-                config, eleve, start_mois, float(total_amount))
+            if not month_entries:
+                return jsonify({
+                    "error": "Aucune distribution possible "
+                             "(mois déjà payés ou montant nul)"
+                }), 400
 
-        if not month_entries:
-            return jsonify({
-                "error": "Aucune distribution possible "
-                         "(mois déjà payés ou montant nul)"
-            }), 400
+            mobile_store  = _load_json(MOBILE_PAYMENTS_FILE, {})
+            school_key    = school_code.lower()
+            mobile_list   = mobile_store.get(school_key, [])
+            today         = datetime.date.today().isoformat()
+            created_ids   = []
 
-        mobile_store  = _load_json(MOBILE_PAYMENTS_FILE, {})
-        school_key    = school_code.lower()
-        mobile_list   = mobile_store.get(school_key, [])
-        today         = datetime.date.today().isoformat()
-        created_ids   = []
+            for entry in month_entries:
+                payment_id = (
+                    f"mob_{datetime.datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+                    f"_{os.urandom(3).hex()}"
+                )
+                mobile_list.append({
+                    "id":          payment_id,
+                    "type":        "mobile_money",
+                    "eleve_id":    student_id,
+                    "annee":       current_year,
+                    "nom":         eleve.get('nom', ''),
+                    "postNom":     eleve.get('postNom', ''),
+                    "prenom":      eleve.get('prenom', ''),
+                    "section":     eleve.get('section', ''),
+                    "classe":      eleve.get('classe', ''),
+                    "mois":        entry['mois'],
+                    "amount":      entry['amount'],
+                    "network":     network,
+                    "parent_name": parent_name,
+                    "date":        today,
+                    "status":      "pending",
+                    "mode":        "manual",
+                })
+                created_ids.append(payment_id)
 
-        for entry in month_entries:
-            payment_id = (
-                f"mob_{datetime.datetime.now().strftime('%Y%m%d%H%M%S%f')}"
-                f"_{os.urandom(3).hex()}"
-            )
-            mobile_list.append({
-                "id":          payment_id,
-                "type":        "mobile_money",
-                "eleve_id":    student_id,
-                "annee":       current_year,
-                "nom":         eleve.get('nom', ''),
-                "postNom":     eleve.get('postNom', ''),
-                "prenom":      eleve.get('prenom', ''),
-                "section":     eleve.get('section', ''),
-                "classe":      eleve.get('classe', ''),
-                "mois":        entry['mois'],
-                "amount":      entry['amount'],
-                "network":     network,
-                "parent_name": parent_name,
-                "date":        today,
-                "status":      "pending",
-                "mode":        "manual",
-            })
-            created_ids.append(payment_id)
+            mobile_store[school_key] = mobile_list
+            _save_json(MOBILE_PAYMENTS_FILE, mobile_store)
 
-        mobile_store[school_key] = mobile_list
-        _save_json(MOBILE_PAYMENTS_FILE, mobile_store)
+            total_sent = sum(e['amount'] for e in month_entries)
+            eleve_nom      = eleve.get('nom', '')
+            eleve_postnom  = eleve.get('postNom', '')
+            months_covered = len(month_entries)
 
-        total_sent = sum(e['amount'] for e in month_entries)
-
+        # notification hors du verrou
         notify_school_role(
             school_code, "promoteur",
             "Nouveau paiement Mobile Money",
-            f"{eleve.get('nom','')} {eleve.get('postNom','')} — "
+            f"{eleve_nom} {eleve_postnom} — "
             f"{total_sent:.0f} FC en attente de confirmation ({network}).",
             data={"type": "mobile_payment", "school_code": school_code},
         )
@@ -1544,7 +2149,7 @@ def _store_pending_mobile_payment(data):
             "success":       True,
             "mode":          "manual",
             "message":       "Demande envoyée. En attente de confirmation par l'école.",
-            "months_covered": len(month_entries),
+            "months_covered": months_covered,
             "total_sent":    total_sent,
             "payment_ids":   created_ids,
         }), 200
@@ -1572,6 +2177,7 @@ def get_mobile_payments():
 
 
 @app.route('/confirm_mobile_payments', methods=['POST'])
+@_locked
 def confirm_mobile_payments():
     try:
         data        = request.get_json()
@@ -1582,12 +2188,9 @@ def confirm_mobile_payments():
             return jsonify({"error": "Code manquant"}), 400
 
         school_key = school_code.lower()
-        filepath   = os.path.join(DATA_DIR, f"{school_key}.json")
-        if not os.path.exists(filepath):
-            return jsonify({"error": "École introuvable"}), 404
-
-        with open(filepath, 'r', encoding='utf-8') as f:
-            saved = json.load(f)
+        filepath, saved, err = _open_school(school_code)
+        if err:
+            return err
         history = saved.get('history', {})
 
         mobile_store = _load_json(MOBILE_PAYMENTS_FILE, {})
@@ -1601,6 +2204,7 @@ def confirm_mobile_payments():
             remaining  = []
 
         confirmed_count = 0
+        touched_ids = []
         for entry in to_confirm:
             year_data = history.get(entry.get('annee'))
             if not year_data:
@@ -1615,7 +2219,7 @@ def confirm_mobile_payments():
             eleve['paid'][entry['mois']] = (
                 eleve['paid'].get(entry['mois'], 0) + entry['amount'])
             eleve.setdefault('transactions', [])
-            # ⚡ NOUVEAU — id stable pour éviter tout doublon côté application
+            # id stable pour éviter tout doublon côté application
             eleve['transactions'].append({
                 'id':          f"SRV_{entry.get('id')}",
                 'date':        entry.get('date'),
@@ -1626,11 +2230,12 @@ def confirm_mobile_payments():
                 'validated':   True,
             })
             confirmed_count += 1
-            # ⚡ SYNC PAIEMENTS — le parent rechargera ses montants
-            bump_payment_versions(school_code, [entry.get('eleve_id')])
+            touched_ids.append(entry.get('eleve_id'))
 
-        with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(saved, f, ensure_ascii=False, indent=2)
+        if confirmed_count:
+            _commit_school(filepath, saved)
+            # ⚡ SYNC PAIEMENTS — le parent rechargera ses montants
+            bump_payment_versions(school_code, touched_ids)
 
         mobile_store[school_key] = remaining
         _save_json(MOBILE_PAYMENTS_FILE, mobile_store)
@@ -1645,8 +2250,18 @@ def confirm_mobile_payments():
         return jsonify({"error": str(e)}), 500
 
 
+def _webhook_authorized():
+    """Si WEBHOOK_SECRET est défini dans l'environnement, les webhooks
+    doivent envoyer l'en-tête X-Webhook-Secret correspondant."""
+    if not WEBHOOK_SECRET:
+        return True
+    return _pw_equal(WEBHOOK_SECRET, request.headers.get('X-Webhook-Secret', ''))
+
+
 @app.route('/webhook/airtel', methods=['POST'])
 def webhook_airtel():
+    if not _webhook_authorized():
+        return jsonify({"error": "Accès refusé"}), 401
     data = request.get_json()
     if data.get('status') != 'SUCCESS':
         return jsonify({"ok": True}), 200
@@ -1673,47 +2288,45 @@ def webhook_vodacom():
 
 
 def _auto_confirm_payment(eleve_id, mois, amount, network, tx_ref=''):
-    for fname in os.listdir(DATA_DIR):
-        if not fname.endswith('.json') or fname in SYSTEM_FILES:
-            continue
-        fpath = os.path.join(DATA_DIR, fname)
-        try:
-            with open(fpath, 'r', encoding='utf-8') as f:
-                saved = json.load(f)
-        except Exception:
-            continue
-
-        current_year = saved.get('currentYear', '')
-        year_data    = saved.get('history', {}).get(current_year, {})
-
-        for e in year_data.get('eleves', []):
-            if e.get('id', '').upper() != eleve_id.upper():
+    with _DATA_LOCK:
+        for fname in os.listdir(DATA_DIR):
+            if not fname.endswith('.json') or fname in SYSTEM_FILES:
+                continue
+            fpath = os.path.join(DATA_DIR, fname)
+            saved = _read_school_json(fpath)
+            if saved is None:
                 continue
 
-            # ⚡ NOUVEAU — id stable + protection contre un webhook rejoué
-            tx_id = (f"SRV_AUTO_{tx_ref}" if tx_ref
-                     else f"SRV_AUTO_{os.urandom(6).hex()}")
-            e.setdefault('transactions', [])
-            if any(t.get('id') == tx_id for t in e['transactions']):
-                return
+            current_year = saved.get('currentYear', '')
+            year_data    = saved.get('history', {}).get(current_year, {})
 
-            e.setdefault('paid', {})
-            e['paid'][mois] = e['paid'].get(mois, 0) + amount
-            e['transactions'].append({
-                'id':          tx_id,
-                'date':        datetime.date.today().isoformat(),
-                'mois':        mois,
-                'amount':      amount,
-                'network':     network,
-                'from_parent': True,
-                'validated':   True,
-                'auto':        True,
-            })
-            with open(fpath, 'w', encoding='utf-8') as f:
-                json.dump(saved, f, ensure_ascii=False, indent=2)
-            # ⚡ SYNC PAIEMENTS — le parent rechargera ses montants
-            bump_payment_versions(fname[:-5], [e.get('id')])
-            return
+            for e in year_data.get('eleves', []):
+                if e.get('id', '').upper() != eleve_id.upper():
+                    continue
+
+                # id stable + protection contre un webhook rejoué
+                tx_id = (f"SRV_AUTO_{tx_ref}" if tx_ref
+                         else f"SRV_AUTO_{os.urandom(6).hex()}")
+                e.setdefault('transactions', [])
+                if any(t.get('id') == tx_id for t in e['transactions']):
+                    return
+
+                e.setdefault('paid', {})
+                e['paid'][mois] = e['paid'].get(mois, 0) + amount
+                e['transactions'].append({
+                    'id':          tx_id,
+                    'date':        datetime.date.today().isoformat(),
+                    'mois':        mois,
+                    'amount':      amount,
+                    'network':     network,
+                    'from_parent': True,
+                    'validated':   True,
+                    'auto':        True,
+                })
+                _commit_school(fpath, saved)
+                # ⚡ SYNC PAIEMENTS — le parent rechargera ses montants
+                bump_payment_versions(fname[:-5], [e.get('id')])
+                return
 
 
 @app.route('/verify_password', methods=['POST'])
@@ -1724,11 +2337,13 @@ def verify_password():
         password    = data.get('password')
         if not school_code or not password:
             return jsonify({"error": "Données manquantes"}), 400
-        filepath = os.path.join(DATA_DIR, f"{school_code.lower()}.json")
+        filepath = _school_path(school_code)
         if os.path.exists(filepath):
-            with open(filepath, 'r', encoding='utf-8') as f:
-                saved_data = json.load(f)
-            if saved_data.get('backup_password') == password:
+            saved_data = _read_school_json(filepath)
+            if saved_data is None:
+                return jsonify({"error": "Fichier du serveur illisible"}), 500
+            stored = saved_data.get('backup_password')
+            if stored is not None and _pw_equal(stored, password):
                 _, school_entry = _find_school_entry(school_code)
                 subscription = _compute_subscription_status(school_entry)
                 return jsonify({
@@ -1762,6 +2377,7 @@ def check_subscription():
 
 
 @app.route('/admin/generate_reconnection_key', methods=['POST'])
+@_locked
 def generate_reconnection_key():
     try:
         data = request.get_json()
@@ -1801,6 +2417,7 @@ def generate_reconnection_key():
 
 
 @app.route('/school/redeem_reconnection_key', methods=['POST'])
+@_locked
 def redeem_reconnection_key():
     try:
         data        = request.get_json()
@@ -1887,6 +2504,7 @@ def _sections_slug(sections):
 
 
 @app.route('/generate_key', methods=['POST'])
+@_locked
 def generate_key():
     try:
         data        = request.get_json()
@@ -1969,12 +2587,11 @@ def verify_key():
             return jsonify({"valid": False, "error": "Clé invalide"}), 404
         school_code  = info["school_code"]
         sections     = _key_sections(info)
-        filepath     = os.path.join(DATA_DIR, f"{school_code.lower()}.json")
+        filepath     = _school_path(school_code)
         school_name  = school_code
         current_year = None
         if os.path.exists(filepath):
-            with open(filepath, 'r', encoding='utf-8') as f:
-                saved = json.load(f)
+            saved = _read_school_json(filepath) or {}
             school_name  = saved.get('config', {}).get('schoolName', school_code)
             current_year = saved.get('currentYear')
 
@@ -1999,6 +2616,7 @@ def verify_key():
 
 
 @app.route('/revoke_key', methods=['POST'])
+@_locked
 def revoke_key():
     try:
         data = request.get_json()
@@ -2040,11 +2658,16 @@ def list_keys():
         return jsonify({"error": str(e)}), 500
 
 
-def _generate_student_id_for_school(school_code, nom, year, school_name, proposed_id=None):
+def _generate_student_id_for_school(school_code, nom, year, school_name,
+                                    proposed_id=None, avoid_ids=None):
+    """Génère un ID élève unique. ⚡ avoid_ids = ID déjà utilisés ailleurs
+    (autres écoles + élèves déjà présents dans le fichier de cette école) :
+    le serveur ne propose plus un ID qui existe déjà."""
     ids_store = _load_json(IDS_FILE, {})
     used_ids  = set(ids_store.get(school_code.lower(), []))
+    blocked   = used_ids | set(avoid_ids or ())
 
-    if proposed_id and proposed_id not in used_ids:
+    if proposed_id and proposed_id not in blocked:
         candidate = proposed_id
     else:
         year_short    = year[-2:] if year and len(year) >= 2 else "26"
@@ -2054,7 +2677,7 @@ def _generate_student_id_for_school(school_code, nom, year, school_name, propose
         base_id       = f"{name_prefix}{year_short}{school_letter}"
         counter       = 1
         candidate     = f"{base_id}{counter}"
-        while candidate in used_ids:
+        while candidate in blocked:
             counter  += 1
             candidate = f"{base_id}{counter}"
 
@@ -2065,6 +2688,7 @@ def _generate_student_id_for_school(school_code, nom, year, school_name, propose
 
 
 @app.route('/generate_student_id', methods=['POST'])
+@_locked
 def generate_student_id():
     try:
         data        = request.get_json()
@@ -2077,8 +2701,13 @@ def generate_student_id():
         if not school_code or not nom:
             return jsonify({"error": "Données manquantes"}), 400
 
+        avoid = _get_all_ids_except(school_code)
+        fp = _school_path(school_code)
+        if os.path.exists(fp):
+            avoid |= _collect_ids(_read_school_json(fp))
+
         candidate = _generate_student_id_for_school(
-            school_code, nom, year, school_name, proposed_id)
+            school_code, nom, year, school_name, proposed_id, avoid_ids=avoid)
         return jsonify({"id": candidate}), 200
     except Exception as e:
         logger.exception("Erreur generate_student_id")
@@ -2086,6 +2715,7 @@ def generate_student_id():
 
 
 @app.route('/school/submit_registration', methods=['POST'])
+@_locked
 def submit_registration():
     try:
         data        = request.get_json()
@@ -2107,7 +2737,7 @@ def submit_registration():
                 "error": "École, année, section, classe et nom sont obligatoires"
             }), 400
 
-        filepath = os.path.join(DATA_DIR, f"{school_code.lower()}.json")
+        filepath = _school_path(school_code)
         if not os.path.exists(filepath):
             return jsonify({"error": "École introuvable"}), 404
 
@@ -2161,6 +2791,7 @@ def get_pending_registrations():
 
 
 @app.route('/school/validate_registrations', methods=['POST'])
+@_locked
 def validate_registrations():
     try:
         data            = request.get_json()
@@ -2171,12 +2802,9 @@ def validate_registrations():
             return jsonify({"error": "Code manquant"}), 400
 
         school_key = school_code.lower()
-        filepath   = os.path.join(DATA_DIR, f"{school_key}.json")
-        if not os.path.exists(filepath):
-            return jsonify({"error": "École introuvable"}), 404
-
-        with open(filepath, 'r', encoding='utf-8') as f:
-            saved = json.load(f)
+        filepath, saved, err = _open_school(school_code)
+        if err:
+            return err
 
         school_name = saved.get('config', {}).get('schoolName', school_code)
 
@@ -2190,6 +2818,9 @@ def validate_registrations():
             to_validate = pending_list
             remaining   = []
 
+        # ⚡ ID déjà pris par d'autres écoles OU déjà présents dans cette école
+        avoid = _get_all_ids_except(school_code) | _collect_ids(saved)
+
         created_students = []
         for entry in to_validate:
             annee = entry.get('annee')
@@ -2197,7 +2828,9 @@ def validate_registrations():
             year_data = saved['history'][annee]
 
             new_id = _generate_student_id_for_school(
-                school_code, entry.get('nom', ''), annee, school_name)
+                school_code, entry.get('nom', ''), annee, school_name,
+                avoid_ids=avoid)
+            avoid.add(new_id)
 
             year_data['eleves'].append({
                 "id":            new_id,
@@ -2216,8 +2849,8 @@ def validate_registrations():
             })
             created_students.append({"registration_id": entry.get('id'), "new_id": new_id})
 
-        with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(saved, f, ensure_ascii=False, indent=2)
+        if created_students:
+            _commit_school(filepath, saved)
 
         pending_store[school_key] = remaining
         _save_json(PENDING_REGISTRATIONS_FILE, pending_store)
@@ -2233,6 +2866,7 @@ def validate_registrations():
 
 
 @app.route('/school/reject_registration', methods=['POST'])
+@_locked
 def reject_registration():
     try:
         data            = request.get_json()
@@ -2259,11 +2893,9 @@ def get_autres_frais():
         school_code = request.args.get('school_code')
         if not school_code:
             return jsonify({"error": "Code manquant"}), 400
-        filepath = os.path.join(DATA_DIR, f"{school_code.lower()}.json")
-        if not os.path.exists(filepath):
-            return jsonify({"error": "École introuvable"}), 404
-        with open(filepath, 'r', encoding='utf-8') as f:
-            saved = json.load(f)
+        filepath, saved, err = _open_school(school_code)
+        if err:
+            return err
         return jsonify({
             "autres_frais": saved.get('autresFrais', []),
         }), 200
@@ -2273,6 +2905,7 @@ def get_autres_frais():
 
 
 @app.route('/school/submit_autre_frais_payment', methods=['POST'])
+@_locked
 def submit_autre_frais_payment():
     try:
         data            = request.get_json()
@@ -2286,11 +2919,9 @@ def submit_autre_frais_payment():
         if not all([school_code, annee, eleve_id, autre_frais_id]) or montant is None:
             return jsonify({"error": "Données manquantes"}), 400
 
-        filepath = os.path.join(DATA_DIR, f"{school_code.lower()}.json")
-        if not os.path.exists(filepath):
-            return jsonify({"error": "École introuvable"}), 404
-        with open(filepath, 'r', encoding='utf-8') as f:
-            saved = json.load(f)
+        filepath, saved, err = _open_school(school_code)
+        if err:
+            return err
 
         frais = next(
             (f for f in saved.get('autresFrais', [])
@@ -2353,6 +2984,7 @@ def get_pending_autres_frais():
 
 
 @app.route('/school/validate_autres_frais_payments', methods=['POST'])
+@_locked
 def validate_autres_frais_payments():
     try:
         data        = request.get_json()
@@ -2363,12 +2995,9 @@ def validate_autres_frais_payments():
             return jsonify({"error": "Code manquant"}), 400
 
         school_key = school_code.lower()
-        filepath   = os.path.join(DATA_DIR, f"{school_key}.json")
-        if not os.path.exists(filepath):
-            return jsonify({"error": "École introuvable"}), 404
-
-        with open(filepath, 'r', encoding='utf-8') as f:
-            saved = json.load(f)
+        filepath, saved, err = _open_school(school_code)
+        if err:
+            return err
         saved.setdefault('autresFraisPaiementsByYear', {})
 
         pending_store = _load_json(PENDING_AUTRES_FRAIS_FILE, {})
@@ -2385,7 +3014,7 @@ def validate_autres_frais_payments():
         for entry in to_validate:
             annee = entry.get('annee')
             saved['autresFraisPaiementsByYear'].setdefault(annee, [])
-            # ⚡ NOUVEAU — on évite d'ajouter deux fois le même paiement (même id)
+            # on évite d'ajouter deux fois le même paiement (même id)
             if any(p.get('id') == entry.get('id')
                    for p in saved['autresFraisPaiementsByYear'][annee]):
                 continue
@@ -2400,8 +3029,8 @@ def validate_autres_frais_payments():
             })
             validated_count += 1
 
-        with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(saved, f, ensure_ascii=False, indent=2)
+        if validated_count:
+            _commit_school(filepath, saved)
 
         pending_store[school_key] = remaining
         _save_json(PENDING_AUTRES_FRAIS_FILE, pending_store)
@@ -2417,6 +3046,7 @@ def validate_autres_frais_payments():
 
 
 @app.route('/school/reject_autre_frais_payment', methods=['POST'])
+@_locked
 def reject_autre_frais_payment():
     try:
         data        = request.get_json()
@@ -2469,39 +3099,6 @@ MAX_CHILDREN_PER_DEVICE = 30
 #   envoi → +2 min → +5 min → +10 min → +15 min → +30 min → +60 min
 URGENT_REMINDER_DELAYS_MIN = [2, 5, 10, 15, 30, 60]
 URGENT_WORKER_INTERVAL_SEC = 30       # fréquence de vérification du robot
-
-_MSG_THREAD_LOCK = threading.RLock()
-_MSG_LOCK_FILE   = os.path.join(DATA_DIR, "parent_messages.lock")
-
-
-@contextlib.contextmanager
-def _messages_lock():
-    """Verrou inter-threads ET inter-processus (gunicorn multi-workers) :
-    évite que deux envois simultanés s'écrasent dans parent_messages.json."""
-    with _MSG_THREAD_LOCK:
-        lock_fd = None
-        try:
-            if fcntl is not None:
-                lock_fd = open(_MSG_LOCK_FILE, 'a')
-                fcntl.flock(lock_fd, fcntl.LOCK_EX)
-            yield
-        finally:
-            if lock_fd is not None:
-                try:
-                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
-                finally:
-                    lock_fd.close()
-
-
-def _save_json_atomic(path, data):
-    """Écriture atomique : le fichier n'est jamais à moitié écrit, même si
-    le serveur redémarre au milieu d'une sauvegarde."""
-    tmp = f"{path}.tmp.{os.getpid()}"
-    with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
 
 
 def _utc_now_iso():
@@ -2574,11 +3171,12 @@ def _school_students_map(school_code):
     """{ID_ELEVE_MAJ: {nom, postNom, prenom, classe, section}} pour l'école."""
     out = {}
     try:
-        fpath = os.path.join(DATA_DIR, f"{school_code.strip().lower()}.json")
+        fpath = _school_path(school_code)
         if not os.path.exists(fpath):
             return out
-        with open(fpath, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+        data = _read_school_json(fpath)
+        if data is None:
+            return out
         for yd in data.get('history', {}).values():
             for e in yd.get('eleves', []):
                 sid = (e.get('id') or '').upper()
@@ -3137,28 +3735,27 @@ def record_absences():
         if not school_code or not annee:
             return jsonify({"error": "Données manquantes"}), 400
 
-        filepath = os.path.join(DATA_DIR, f"{school_code.lower()}.json")
-        if not os.path.exists(filepath):
-            return jsonify({"error": "École introuvable"}), 404
-        with open(filepath, 'r', encoding='utf-8') as f:
-            saved = json.load(f)
+        filepath, saved, err = _open_school(school_code)
+        if err:
+            return err
         year_data     = saved.get('history', {}).get(annee, {})
         eleves_by_id  = {e.get('id'): e for e in year_data.get('eleves', [])}
 
-        attendance_store  = _load_json(ATTENDANCE_FILE, {})
-        school_key        = school_code.lower()
-        school_attendance = attendance_store.get(school_key, {})
-        date_attendance    = school_attendance.get(date_str, {})
-        class_key          = classe or "toutes"
-        date_attendance[class_key] = {
-            "absents":     absent_ids,
-            "section":     section,
-            "recorded_at": datetime.datetime.now().isoformat(),
-            "recorded_by": recorded_by,
-        }
-        school_attendance[date_str] = date_attendance
-        attendance_store[school_key] = school_attendance
-        _save_json(ATTENDANCE_FILE, attendance_store)
+        with _DATA_LOCK:
+            attendance_store  = _load_json(ATTENDANCE_FILE, {})
+            school_key        = school_code.lower()
+            school_attendance = attendance_store.get(school_key, {})
+            date_attendance    = school_attendance.get(date_str, {})
+            class_key          = classe or "toutes"
+            date_attendance[class_key] = {
+                "absents":     absent_ids,
+                "section":     section,
+                "recorded_at": datetime.datetime.now().isoformat(),
+                "recorded_by": recorded_by,
+            }
+            school_attendance[date_str] = date_attendance
+            attendance_store[school_key] = school_attendance
+            _save_json(ATTENDANCE_FILE, attendance_store)
 
         default_text = (custom_message or
             "Votre enfant était absent(e) à l'école aujourd'hui "
@@ -3271,11 +3868,9 @@ def send_announcement():
         if not school_code or not annee or not message:
             return jsonify({"error": "Données manquantes"}), 400
 
-        filepath = os.path.join(DATA_DIR, f"{school_code.lower()}.json")
-        if not os.path.exists(filepath):
-            return jsonify({"error": "École introuvable"}), 404
-        with open(filepath, 'r', encoding='utf-8') as f:
-            saved = json.load(f)
+        filepath, saved, err = _open_school(school_code)
+        if err:
+            return err
         year_data = saved.get('history', {}).get(annee, {})
         eleves    = year_data.get('eleves', [])
 
@@ -3738,7 +4333,7 @@ def school_mark_conversation_read():
 
 @app.route('/school/get_sent_messages', methods=['GET'])
 def school_get_sent_messages():
-    """⚡ NOUVEAU — Écran « Messages envoyés » de l'école.
+    """⚡ Écran « Messages envoyés » de l'école.
     Liste des ENVOIS de l'école (un communiqué envoyé à 30 élèves = 1 ligne),
     du plus récent au plus ancien, avec pour chacun le nombre de parents qui
     ont LU / pas encore lu.
@@ -3835,7 +4430,7 @@ def school_get_sent_messages():
 
 @app.route('/school/get_message_receipts', methods=['GET'])
 def school_get_message_receipts():
-    """⚡ NOUVEAU — Détail d'UN envoi : pour chaque élève (donc chaque
+    """⚡ Détail d'UN envoi : pour chaque élève (donc chaque
     parent) → « lu à 14:32 », « reçu mais pas lu », « pas encore reçu »,
     et le nombre de téléphones enregistrés (0 = ce parent ne peut pas
     recevoir de notification).
@@ -3909,7 +4504,7 @@ def school_get_message_receipts():
 
 @app.route('/school/stop_reminders', methods=['POST'])
 def school_stop_reminders():
-    """⚡ NOUVEAU — L'école arrête les rappels vibrants d'un message urgent
+    """⚡ L'école arrête les rappels vibrants d'un message urgent
     (par exemple parce qu'elle a joint le parent par téléphone).
     Corps : school_code + (batch_id OU message_id)."""
     try:
@@ -4095,12 +4690,13 @@ def create_promoter_request():
             "created_at":      datetime.datetime.now().isoformat(),
         }
 
-        school_key   = school_code.lower()
-        store        = _load_json(PROMOTER_PENDING_REQUESTS_FILE, {})
-        pending_list = store.get(school_key, [])
-        pending_list.append(entry)
-        store[school_key] = pending_list
-        _save_json(PROMOTER_PENDING_REQUESTS_FILE, store)
+        school_key = school_code.lower()
+        with _DATA_LOCK:
+            store        = _load_json(PROMOTER_PENDING_REQUESTS_FILE, {})
+            pending_list = store.get(school_key, [])
+            pending_list.append(entry)
+            store[school_key] = pending_list
+            _save_json(PROMOTER_PENDING_REQUESTS_FILE, store)
 
         logger.info(
             "📨 create_promoter_request : école='%s' type='%s' id='%s'",
@@ -4151,6 +4747,7 @@ def get_promoter_requests():
 
 
 @app.route('/school/resolve_promoter_request', methods=['POST'])
+@_locked
 def resolve_promoter_request():
     try:
         data        = request.get_json()
@@ -4229,8 +4826,9 @@ def admin_health():
         for fname in fichiers_ecoles:
             fpath = os.path.join(DATA_DIR, fname)
             try:
-                with open(fpath, 'r', encoding='utf-8') as f:
-                    d = json.load(f)
+                d = _read_school_json(fpath)
+                if d is None:
+                    raise ValueError("illisible")
                 nb_eleves = sum(
                     len(yd.get('eleves', []))
                     for yd in d.get('history', {}).values()
@@ -4239,6 +4837,8 @@ def admin_health():
                     "school_code": fname.replace('.json', '').upper(),
                     "school_name": d.get('config', {}).get('schoolName', ''),
                     "nb_eleves":   nb_eleves,
+                    "revision":    _school_revision(d),
+                    "nb_versions_historique": len(_list_snapshots(fpath)),
                 })
             except Exception:
                 details.append({"school_code": fname, "error": "fichier corrompu"})
@@ -4263,6 +4863,11 @@ def admin_health():
             "parent_devices":  len(_load_json(PARENT_DEVICES_FILE, {})),
             "urgent_unread_messages": urgent_pending,
             "reminder_worker_running": _reminder_state["pid"] == os.getpid(),
+            "strict_auth":     STRICT_AUTH,
+            "require_base_revision": REQUIRE_BASE_REVISION,
+            "guard_ratio":     GUARD_RATIO,
+            "max_snapshots":   MAX_SNAPSHOTS,
+            "admin_password_from_env": bool(os.environ.get("ADMIN_PASSWORD")),
         }), 200
     except Exception as e:
         logger.exception("Erreur admin_health")
