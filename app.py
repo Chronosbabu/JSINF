@@ -37,6 +37,7 @@ MOBILE_PAYMENTS_FILE        = os.path.join(DATA_DIR, "mobile_payments.json")
 SCHOOLS_FILE                = os.path.join(DATA_DIR, "schools_registry.json")
 ATTENDANCE_FILE             = os.path.join(DATA_DIR, "attendance_records.json")
 MESSAGES_FILE                = os.path.join(DATA_DIR, "parent_messages.json")
+MESSAGES_SEQ_FLOOR_FILE      = os.path.join(DATA_DIR, "messages_seq_floor.json")
 PENDING_REGISTRATIONS_FILE  = os.path.join(DATA_DIR, "pending_registrations.json")
 PENDING_AUTRES_FRAIS_FILE   = os.path.join(DATA_DIR, "pending_autres_frais.json")
 SUBSCRIPTION_KEYS_FILE      = os.path.join(DATA_DIR, "subscription_keys.json")
@@ -102,6 +103,7 @@ SYSTEM_FILES = {
     'pending_payments.json', 'mobile_payments.json',
     'schools_registry.json',
     'attendance_records.json', 'parent_messages.json',
+    'messages_seq_floor.json',
     'pending_registrations.json', 'pending_autres_frais.json',
     'subscription_keys.json',
     'promoter_summary.json', 'promoter_pending_requests.json',
@@ -3088,6 +3090,12 @@ def reject_autre_frais_payment():
 # ====================================================================
 
 MAX_MESSAGE_LENGTH      = 2000
+MAX_TITLE_LENGTH        = 80
+MAX_MESSAGE_REQUEST_BYTES = 256 * 1024
+MESSAGE_PURGE_DEFAULT_MAX_CHARS = 10000
+MESSAGE_PURGE_MAX_TITLE_CHARS   = 1000
+MESSAGE_PURGE_MARKER    = "[[MESSAGE_TROP_LONG_SUPPRIME]]"
+STREAM_SHRINK_THRESHOLD_BYTES = 30 * 1024 * 1024
 PARENT_RATE_LIMIT       = 20          # messages max / minute / élève
 PARENT_PUSH_CHANNEL_ID  = "edupay_parent_messages"
 # Doit être IDENTIQUE à kUrgentChannelId dans notification_service.dart
@@ -3099,6 +3107,47 @@ MAX_CHILDREN_PER_DEVICE = 30
 #   envoi → +2 min → +5 min → +10 min → +15 min → +30 min → +60 min
 URGENT_REMINDER_DELAYS_MIN = [2, 5, 10, 15, 30, 60]
 URGENT_WORKER_INTERVAL_SEC = 30       # fréquence de vérification du robot
+
+_SIZE_LIMITED_POST_PATHS = {
+    '/school/send_convocation',
+    '/school/send_announcement',
+    '/school/record_absences',
+    '/school/reply_message',
+    '/parent/send_message',
+}
+
+
+@app.before_request
+def _guard_message_payload_size():
+    if request.method != 'POST' or request.path not in _SIZE_LIMITED_POST_PATHS:
+        return None
+    length = request.content_length
+    if length is not None and length > MAX_MESSAGE_REQUEST_BYTES:
+        logger.warning(
+            "Message refusé (requête trop grosse) : %s %d octets",
+            request.path, length)
+        return jsonify({
+            "error": f"Message trop long. Maximum {MAX_MESSAGE_LENGTH} "
+                     f"caractères.",
+            "code": "MESSAGE_TOO_LARGE",
+        }), 413
+    return None
+
+
+def _check_message_limits(text, title=None):
+    if len(text or '') > MAX_MESSAGE_LENGTH:
+        return jsonify({
+            "error": f"Message trop long : {len(text)} caractères "
+                     f"(maximum {MAX_MESSAGE_LENGTH}).",
+            "code": "MESSAGE_TOO_LONG",
+        }), 413
+    if title is not None and len(title) > MAX_TITLE_LENGTH:
+        return jsonify({
+            "error": f"Titre trop long : {len(title)} caractères "
+                     f"(maximum {MAX_TITLE_LENGTH}).",
+            "code": "TITLE_TOO_LONG",
+        }), 413
+    return None
 
 
 def _utc_now_iso():
@@ -3142,6 +3191,96 @@ def _run_async(fn, *args, **kwargs):
         except Exception:
             logger.exception("Tâche d'arrière-plan : échec (non bloquant)")
     threading.Thread(target=_runner, daemon=True).start()
+
+
+def _shrink_huge_message_lines(path, max_chars):
+    tmp = f"{path}.shrink.{os.getpid()}"
+    replaced = 0
+    line_re = re.compile(r'^(\s*)"(message|title)":\s*"')
+    try:
+        with open(path, 'r', encoding='utf-8') as src, \
+                open(tmp, 'w', encoding='utf-8') as dst:
+            for line in src:
+                if len(line) > max_chars + 64:
+                    m = line_re.match(line)
+                    if m:
+                        comma = ',' if line.rstrip().endswith(',') else ''
+                        dst.write(
+                            f'{m.group(1)}"{m.group(2)}": '
+                            f'"{MESSAGE_PURGE_MARKER}"{comma}\n')
+                        replaced += 1
+                        continue
+                dst.write(line)
+            dst.flush()
+            os.fsync(dst.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        raise
+    return replaced
+
+
+def _is_oversized_message(m, limit):
+    text  = str(m.get('message') or '')
+    title = str(m.get('title') or '')
+    return (text == MESSAGE_PURGE_MARKER
+            or title == MESSAGE_PURGE_MARKER
+            or len(text) > limit
+            or len(title) > MESSAGE_PURGE_MAX_TITLE_CHARS)
+
+
+def _purge_oversized_messages(max_chars=None):
+    limit = int(max_chars or MESSAGE_PURGE_DEFAULT_MAX_CHARS)
+    limit = max(limit, MAX_MESSAGE_LENGTH)
+    report = {
+        "limit":        limit,
+        "removed":      0,
+        "schools":      {},
+        "size_before":  0,
+        "size_after":   0,
+        "lines_shrunk": 0,
+    }
+    with _messages_lock():
+        if not os.path.exists(MESSAGES_FILE):
+            return report
+        report["size_before"] = os.path.getsize(MESSAGES_FILE)
+        if report["size_before"] > STREAM_SHRINK_THRESHOLD_BYTES:
+            report["lines_shrunk"] = _shrink_huge_message_lines(
+                MESSAGES_FILE, limit)
+
+        store  = _load_json(MESSAGES_FILE, {})
+        floors = _load_json(MESSAGES_SEQ_FLOOR_FILE, {})
+        changed = False
+        for school_key, lst in list(store.items()):
+            keep, dropped = [], []
+            for m in lst:
+                if _is_oversized_message(m, limit):
+                    dropped.append(m)
+                else:
+                    keep.append(m)
+            if not dropped:
+                continue
+            top_dropped = max((m.get('seq') or 0 for m in dropped), default=0)
+            floors[school_key] = max(floors.get(school_key, 0), top_dropped)
+            store[school_key] = keep
+            report["schools"][school_key] = len(dropped)
+            report["removed"] += len(dropped)
+            changed = True
+
+        if changed:
+            _save_json_atomic(MESSAGES_SEQ_FLOOR_FILE, floors)
+            _save_json_atomic(MESSAGES_FILE, store)
+        report["size_after"] = os.path.getsize(MESSAGES_FILE)
+    if report["removed"]:
+        logger.warning(
+            "🧹 Messages trop longs supprimés : %d (%s) — fichier %d → %d octets",
+            report["removed"], report["schools"],
+            report["size_before"], report["size_after"])
+    return report
 
 
 def _migrate_messages_store():
@@ -3216,7 +3355,10 @@ def _add_messages_bulk(school_code, items):
     with _messages_lock():
         store    = _load_json(MESSAGES_FILE, {})
         msg_list = store.get(school_key, [])
-        seq      = max((m.get('seq') or 0 for m in msg_list), default=0)
+        floors   = _load_json(MESSAGES_SEQ_FLOOR_FILE, {})
+        seq      = max(
+            max((m.get('seq') or 0 for m in msg_list), default=0),
+            floors.get(school_key, 0))
         now_dt   = datetime.datetime.now(datetime.timezone.utc)
         now_iso  = now_dt.isoformat()
         today    = datetime.date.today().isoformat()
@@ -3240,8 +3382,8 @@ def _add_messages_bulk(school_code, items):
                 "batch_id":   batch_id,
                 "type":       it.get('type') or 'message',
                 "student_id": sid,
-                "title":      it.get('title') or '',
-                "message":    it.get('message') or '',
+                "title":      (it.get('title') or '')[:MAX_TITLE_LENGTH],
+                "message":    (it.get('message') or '')[:MAX_MESSAGE_LENGTH],
                 "sender":     sender,
                 "date":       today,
                 "created_at": now_iso,
@@ -3735,6 +3877,10 @@ def record_absences():
         if not school_code or not annee:
             return jsonify({"error": "Données manquantes"}), 400
 
+        limit_err = _check_message_limits(custom_message)
+        if limit_err:
+            return limit_err
+
         filepath, saved, err = _open_school(school_code)
         if err:
             return err
@@ -3825,6 +3971,10 @@ def send_convocation():
         if not school_code or not student_id or not message:
             return jsonify({"error": "Données manquantes"}), 400
 
+        limit_err = _check_message_limits(message, title)
+        if limit_err:
+            return limit_err
+
         stu   = _school_students_map(school_code).get(student_id.strip().upper(), {})
         extra = {}
         if stu:
@@ -3867,6 +4017,10 @@ def send_announcement():
 
         if not school_code or not annee or not message:
             return jsonify({"error": "Données manquantes"}), 400
+
+        limit_err = _check_message_limits(message, title)
+        if limit_err:
+            return limit_err
 
         filepath, saved, err = _open_school(school_code)
         if err:
@@ -4590,6 +4744,36 @@ def admin_test_parent_push():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route('/admin/purge_oversized_messages', methods=['POST'])
+def admin_purge_oversized_messages():
+    """Supprime de la messagerie les messages beaucoup trop longs (ceux qui
+    font planter le serveur). Corps : admin_password et, en option,
+    max_chars (par défaut 10000 caractères). Les numéros de messages
+    restent cohérents : les applications ne ratent aucun message futur."""
+    try:
+        data = request.get_json(silent=True) or {}
+        if not _pw_equal(ADMIN_PASSWORD, data.get('admin_password', '')):
+            return jsonify({"error": "Accès refusé"}), 401
+        max_chars = None
+        if data.get('max_chars') is not None:
+            try:
+                max_chars = int(data.get('max_chars'))
+            except (TypeError, ValueError):
+                return jsonify({"error": "max_chars invalide"}), 400
+        report = _purge_oversized_messages(max_chars)
+        return jsonify({"message": "Nettoyage terminé", **report}), 200
+    except Exception as e:
+        logger.exception("Erreur admin_purge_oversized_messages")
+        return jsonify({"error": str(e)}), 500
+
+
+try:
+    _startup_purge = _purge_oversized_messages()
+    if _startup_purge["removed"]:
+        logger.warning("🧹 Nettoyage au démarrage : %s", _startup_purge)
+except Exception:
+    logger.exception("Nettoyage des messages trop longs au démarrage : échec")
+
 _migrate_messages_store()
 _ensure_reminder_worker()
 
@@ -4853,6 +5037,14 @@ def admin_health():
         except Exception:
             pass
 
+        messages_file_mb = None
+        try:
+            if os.path.exists(MESSAGES_FILE):
+                messages_file_mb = round(
+                    os.path.getsize(MESSAGES_FILE) / (1024 * 1024), 3)
+        except Exception:
+            pass
+
         return jsonify({
             "server_time":     datetime.datetime.now().isoformat(),
             "data_dir":        os.path.abspath(DATA_DIR),
@@ -4862,6 +5054,7 @@ def admin_health():
             "firebase_ready":  _firebase_ready(),
             "parent_devices":  len(_load_json(PARENT_DEVICES_FILE, {})),
             "urgent_unread_messages": urgent_pending,
+            "messages_file_mb": messages_file_mb,
             "reminder_worker_running": _reminder_state["pid"] == os.getpid(),
             "strict_auth":     STRICT_AUTH,
             "require_base_revision": REQUIRE_BASE_REVISION,
