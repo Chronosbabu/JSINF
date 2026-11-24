@@ -396,6 +396,26 @@ def _school_stats(data):
             "paid_total": paid_total, "autres_frais_paiements": afr}
 
 
+def _eleves_paiements_modifies(old, new):
+    """⚡ Élèves dont les paiements (paid / transactions) diffèrent entre
+    l'ancien fichier du serveur et la nouvelle sauvegarde. Sert à mettre à
+    jour la « version des paiements » lue par les applications des parents
+    (aucune notification n'est envoyée)."""
+    def _par_id(data):
+        out = {}
+        for yd in ((data or {}).get('history') or {}).values():
+            for e in (yd or {}).get('eleves', []) or []:
+                if isinstance(e, dict) and e.get('id'):
+                    cle = json.dumps(
+                        [e.get('paid') or {}, e.get('transactions') or []],
+                        sort_keys=True, ensure_ascii=False, default=str)
+                    out[str(e['id']).upper()] = out.get(
+                        str(e['id']).upper(), '') + cle
+        return out
+    a, b = _par_id(old), _par_id(new)
+    return [sid for sid, v in b.items() if a.get(sid) != v]
+
+
 def _detect_data_loss(old, new):
     """Compare l'état du serveur (old) à la sauvegarde reçue (new).
     Retourne la liste des problèmes (vide = tout va bien). Empêche qu'un PC
@@ -1503,9 +1523,21 @@ def backup():
             corrected_data['_revision'] = new_rev
             corrected_data['_saved_at'] = datetime.datetime.now().isoformat()
 
+            # ⚡ élèves dont les paiements changent (calculé AVANT l'écriture)
+            modifies = _eleves_paiements_modifies(existing, corrected_data)
+
             # --- 5) instantané PUIS écriture atomique ---
             _snapshot_before_write(filepath)
             _save_json(filepath, corrected_data)
+
+            # ⚡ les applications des parents rechargeront ces paiements
+            # (l'envoi automatique des paiements est coupé dans l'application).
+            if modifies:
+                try:
+                    bump_payment_versions(school_code, modifies)
+                except Exception:
+                    logger.exception("backup : version des paiements non "
+                                     "mise à jour (non bloquant)")
 
             if _register_orphan_school_file(school_code, filepath):
                 logger.info(
@@ -5117,6 +5149,14 @@ register_payment_sync(app, {
     "run_async":          _run_async,
     "notify_parents":     notify_parents_of_messages,
     "get_all_ids_except": _get_all_ids_except,
+    # ⚡ correction de la synchronisation : même verrou, même chemin, même
+    # lecture / écriture (révision + instantané) que /backup.
+    "data_lock":          _DATA_LOCK,
+    "school_path":        _school_path,
+    "valid_school_code":  _valid_school_code,
+    "read_school":        _read_school_json,
+    "commit_school":      _commit_school,
+    "pw_equal":           _pw_equal,
 })
 
 _sync_orphan_schools()

@@ -236,15 +236,69 @@ def _same_state(old_paid, old_txs, new_paid, new_txs):
 
 
 # --------------------------------------------------------------------
+# ⚡ FUSION SANS SUPPRESSION (correction de la synchronisation)
+# --------------------------------------------------------------------
+
+def _fusionner_ajouts(old_txs, new_txs):
+    """Retourne (transactions fusionnées, transactions ajoutées).
+    Seules les transactions INCONNUES du serveur sont ajoutées (même clé que
+    _index : identifiant, ou signature date|mois|montant pour les
+    transactions sans identifiant ou avec un identifiant LEG_). Rien n'est
+    jamais supprimé ni modifié : les annulations / modifications passent
+    uniquement par la sauvegarde complète (/backup)."""
+    old_valides = [t for t in (old_txs or []) if isinstance(t, dict)]
+    old_i = _index(old_valides)
+    ajoutees = [t for k, t in _index(new_txs).items() if k not in old_i]
+    if not ajoutees:
+        return list(old_txs or []), []
+    fusion = list(old_txs or []) + [dict(t) for t in ajoutees]
+    fusion.sort(key=lambda t: str(t.get('date', '')) if isinstance(t, dict) else '')
+    return fusion, ajoutees
+
+
+def _paid_apres_fusion(old_paid, txs):
+    """Même règle que l'application (_syncFusionnerEleve) : un mois qui a
+    des transactions = somme de ses transactions ; un mois sans transaction
+    garde le montant déjà connu du serveur."""
+    paid = {}
+    for t in txs:
+        if not isinstance(t, dict):
+            continue
+        mois = str(t.get('mois', '') or '')
+        if mois:
+            paid[mois] = paid.get(mois, 0.0) + _amount(t)
+    for mois, v in (old_paid or {}).items():
+        if str(mois) not in paid and _num(v) > 0:
+            paid[str(mois)] = _num(v)
+    return paid
+
+
+# --------------------------------------------------------------------
 # ROUTE
 # --------------------------------------------------------------------
 
 def register_payment_sync(app, deps):
     """deps : add_messages_bulk, run_async, notify_parents,
-    get_all_ids_except (fonctions de app.py)."""
+    get_all_ids_except, data_lock, school_path, valid_school_code,
+    read_school, commit_school, pw_equal (fonctions de app.py)."""
 
     @app.route('/school/sync_student_payments', methods=['POST'])
     def sync_student_payments():
+        """⚡ CORRIGÉ — FUSION SANS SUPPRESSION.
+        Avant : les paiements de l'élève étaient REMPLACÉS par ceux de
+        l'ordinateur qui envoie, sans changer la révision : un ordinateur en
+        retard effaçait les paiements saisis ailleurs.
+        Maintenant :
+          • seules les transactions inconnues du serveur sont AJOUTÉES ;
+          • aucun élève n'est créé ;
+          • même verrou que /backup, révision +1, instantané avant écriture ;
+          • mot de passe obligatoire.
+        Compatibilité avec les anciennes versions de l'application : quand
+        rien n'est écrit (mot de passe absent ou faux, école inconnue, élève
+        inconnu), on répond quand même 200 avec "done" = élèves reçus, pour
+        que leur file d'attente se vide (pas de bandeau ni de renvoi en
+        boucle). "auth_refused" / "ignored" sont des champs en plus, que les
+        anciennes versions ignorent."""
         try:
             data = request.get_json(silent=True) or {}
             school_code = (data.get('school_code') or '').strip()
@@ -252,37 +306,52 @@ def register_payment_sync(app, deps):
             if not school_code or not isinstance(students, list):
                 return jsonify({"error": "Données manquantes"}), 400
 
-            filepath = os.path.join(DATA_DIR, f"{school_code.lower()}.json")
-            if not os.path.exists(filepath):
+            recus = []
+            for s in students:
+                if isinstance(s, dict):
+                    sid = str(s.get('id') or '').strip()
+                    if sid:
+                        recus.append(sid)
+
+            def _rien_ecrit(motif, auth_refused=False):
+                logger.warning(
+                    "sync_student_payments : rien écrit (%s) école='%s' "
+                    "élèves=%d", motif, school_code, len(recus))
                 return jsonify({
-                    "error": "Aucune sauvegarde de l'école sur le serveur",
-                    "needs_backup": True,
-                }), 404
+                    "done": recus,
+                    "changed": 0,
+                    "ignored": recus,
+                    "auth_refused": auth_refused,
+                }), 200
 
-            done, pending_events, changed_ids = [], [], []
+            if not deps['valid_school_code'](school_code):
+                return _rien_ecrit("code école invalide")
+            filepath = deps['school_path'](school_code)
+            if not os.path.exists(filepath):
+                return _rien_ecrit("école inconnue")
 
-            with _locked(_SCHOOL_LOCK_FILE):
-                saved = _load(filepath, None)
+            done, pending_events, changed_ids, ignored = [], [], [], []
+
+            with deps['data_lock']:
+                saved = deps['read_school'](filepath)
                 if not isinstance(saved, dict):
                     return jsonify({"error": "Fichier école illisible"}), 500
 
+                stored_pw = saved.get('backup_password')
                 password = data.get('password')
-                if (password and saved.get('backup_password')
-                        and password != saved.get('backup_password')):
-                    return jsonify({"error": "Mot de passe incorrect"}), 401
+                if not stored_pw or not password or \
+                        not deps['pw_equal'](stored_pw, password):
+                    return _rien_ecrit("mot de passe absent ou incorrect",
+                                       auth_refused=True)
 
                 year = str(data.get('annee') or saved.get('currentYear') or '')
-                if not year:
-                    return jsonify({"error": "Année introuvable"}), 400
-
-                history = saved.setdefault('history', {})
-                year_data = history.setdefault(year, {})
-                eleves = year_data.setdefault('eleves', [])
+                year_data = (saved.get('history') or {}).get(year)
+                eleves = (year_data or {}).get('eleves') \
+                    if isinstance(year_data, dict) else None
+                if not isinstance(eleves, list):
+                    return _rien_ecrit(f"année '{year}' absente du serveur")
                 by_id = {str(e.get('id', '')).upper(): e
                          for e in eleves if isinstance(e, dict)}
-
-                other_ids = None
-                file_changed = False
 
                 for snap in students:
                     if not isinstance(snap, dict):
@@ -290,59 +359,41 @@ def register_payment_sync(app, deps):
                     sid = str(snap.get('id') or '').strip()
                     if not sid:
                         continue
-                    paid_in = snap.get('paid')
                     txs_in = snap.get('transactions')
-                    if not isinstance(paid_in, dict) or not isinstance(txs_in, list):
+                    if not isinstance(txs_in, list):
                         done.append(sid)
                         continue
-
-                    new_paid = {str(k): _num(v) for k, v in paid_in.items()}
                     new_txs = [t for t in txs_in if isinstance(t, dict)]
 
                     e = by_id.get(sid.upper())
                     if e is None:
-                        # Élève jamais sauvegardé : on le crée (sauf conflit
-                        # d'ID avec une autre école).
-                        if other_ids is None:
-                            other_ids = {
-                                str(x).upper() for x in
-                                deps['get_all_ids_except'](school_code)}
-                        if sid.upper() in other_ids:
-                            done.append(sid)
-                            continue
-                        e = {
-                            "id": sid,
-                            "nom": snap.get('nom', ''),
-                            "postNom": snap.get('postNom', ''),
-                            "prenom": snap.get('prenom', ''),
-                            "classe": snap.get('classe', ''),
-                            "section": snap.get('section', ''),
-                            "paid": {},
-                            "transactions": [],
-                            "customFields": {},
-                        }
-                        eleves.append(e)
-                        by_id[sid.upper()] = e
-
-                    old_paid = e.get('paid') or {}
-                    old_txs = e.get('transactions') or []
-
-                    if _same_state(old_paid, old_txs, new_paid, new_txs):
+                        # Élève jamais sauvegardé : il arrivera sur le
+                        # serveur par « Sauvegarder » (on ne crée plus de
+                        # fiche incomplète, source de doublons).
+                        ignored.append(sid)
                         done.append(sid)
                         continue
 
-                    events = _build_events(old_txs, new_txs,
+                    old_txs = e.get('transactions') or []
+                    fusion, ajoutees = _fusionner_ajouts(old_txs, new_txs)
+                    if not ajoutees:
+                        done.append(sid)
+                        continue
+
+                    new_paid = _paid_apres_fusion(e.get('paid') or {}, fusion)
+                    events = _build_events(old_txs, fusion,
                                            sum(new_paid.values()))
+                    e['transactions'] = fusion
                     e['paid'] = new_paid
-                    e['transactions'] = new_txs
-                    file_changed = True
                     changed_ids.append(sid)
                     done.append(sid)
                     if events:
                         pending_events.append((sid, events))
 
-                if file_changed:
-                    _save_atomic(filepath, saved)
+                if changed_ids:
+                    # Révision +1 : les ordinateurs récupéreront ces ajouts
+                    # avant leur prochaine sauvegarde (STALE_REVISION).
+                    deps['commit_school'](filepath, saved)
                     # AVANT les notifications : quand le parent se synchronise
                     # suite à la notification, la version est déjà à jour.
                     bump_payment_versions(school_code, changed_ids)
@@ -369,8 +420,14 @@ def register_payment_sync(app, deps):
                                      "échouée (non bloquant)")
 
             logger.info("💸 sync_student_payments : école='%s' reçus=%d "
-                        "modifiés=%d", school_code, len(done), len(changed_ids))
-            return jsonify({"done": done, "changed": len(changed_ids)}), 200
+                        "modifiés=%d ignorés=%d", school_code, len(done),
+                        len(changed_ids), len(ignored))
+            return jsonify({
+                "done": done,
+                "changed": len(changed_ids),
+                "ignored": ignored,
+                "auth_refused": False,
+            }), 200
         except Exception as e:
             logger.exception("Erreur sync_student_payments")
             return jsonify({"error": str(e)}), 500
