@@ -352,6 +352,10 @@ def register_payment_sync(app, deps):
                     return _rien_ecrit(f"année '{year}' absente du serveur")
                 by_id = {str(e.get('id', '')).upper(): e
                          for e in eleves if isinstance(e, dict)}
+                # Paiements annulés par une sauvegarde complète : jamais
+                # réajoutés (voir _maj_tx_supprimees dans app.py).
+                supprimees = {x for x in (saved.get('_tx_supprimees') or [])
+                              if isinstance(x, str)}
 
                 for snap in students:
                     if not isinstance(snap, dict):
@@ -374,6 +378,11 @@ def register_payment_sync(app, deps):
                         done.append(sid)
                         continue
 
+                    cle_eleve = str(e.get('id', '')).strip().upper()
+                    new_txs = [
+                        t for t in new_txs
+                        if f"{cle_eleve}|{str(t.get('id') or '').strip()}"
+                        not in supprimees]
                     old_txs = e.get('transactions') or []
                     fusion, ajoutees = _fusionner_ajouts(old_txs, new_txs)
                     if not ajoutees:

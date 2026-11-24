@@ -416,6 +416,54 @@ def _eleves_paiements_modifies(old, new):
     return [sid for sid, v in b.items() if a.get(sid) != v]
 
 
+_MAX_TX_SUPPRIMEES = 20000
+
+
+def _maj_tx_supprimees(old, new):
+    """⚡ Liste des paiements SUPPRIMÉS (annulés) par une sauvegarde complète,
+    au format ["ID_ELEVE|ID_TRANSACTION", ...] (du plus ancien au plus
+    récent). La route /school/sync_student_payments refuse de les
+    réajouter : un ancien ordinateur en retard ne peut plus faire revenir
+    un paiement annulé.
+      • reprise de la liste précédente (les applications ne la renvoient
+        pas) ;
+      • un paiement présent à nouveau dans la sauvegarde en est retiré ;
+      • seuls les vrais identifiants comptent (pas les LEG_ ni les
+        transactions sans identifiant) ; un élève absent de la sauvegarde
+        (archivé, renommé) n'est pas concerné ;
+      • au plus _MAX_TX_SUPPRIMEES entrées (les plus anciennes sont
+        oubliées)."""
+    def _par_eleve(data):
+        out = {}
+        for yd in ((data or {}).get('history') or {}).values():
+            for e in (yd or {}).get('eleves', []) or []:
+                if not (isinstance(e, dict) and e.get('id')):
+                    continue
+                ids = out.setdefault(str(e['id']).strip().upper(), set())
+                for t in e.get('transactions') or []:
+                    if isinstance(t, dict):
+                        tid = str(t.get('id') or '').strip()
+                        if tid and not tid.startswith('LEG_'):
+                            ids.add(tid)
+        return out
+
+    avant, apres = _par_eleve(old), _par_eleve(new)
+    vivantes = {f"{sid}|{tid}" for sid, ids in apres.items() for tid in ids}
+
+    liste = [x for x in ((old or {}).get('_tx_supprimees') or [])
+             if isinstance(x, str) and x not in vivantes]
+    deja = set(liste)
+    for sid, ids in avant.items():
+        if sid not in apres:
+            continue
+        for tid in sorted(ids - apres[sid]):
+            cle = f"{sid}|{tid}"
+            if cle not in deja:
+                liste.append(cle)
+                deja.add(cle)
+    return liste[-_MAX_TX_SUPPRIMEES:]
+
+
 def _detect_data_loss(old, new):
     """Compare l'état du serveur (old) à la sauvegarde reçue (new).
     Retourne la liste des problèmes (vide = tout va bien). Empêche qu'un PC
@@ -1525,6 +1573,10 @@ def backup():
 
             # ⚡ élèves dont les paiements changent (calculé AVANT l'écriture)
             modifies = _eleves_paiements_modifies(existing, corrected_data)
+            # ⚡ paiements annulés : ne pourront plus être réajoutés par
+            # /school/sync_student_payments
+            corrected_data['_tx_supprimees'] = _maj_tx_supprimees(
+                existing, corrected_data)
 
             # --- 5) instantané PUIS écriture atomique ---
             _snapshot_before_write(filepath)
@@ -1615,6 +1667,7 @@ def restore():
         )
 
     data.pop('backup_password', None)
+    data.pop('_tx_supprimees', None)   # ⚡ usage interne du serveur
     _, school_entry = _find_school_entry(school_code)
     data['subscription'] = _compute_subscription_status(school_entry)
     data['revision'] = _school_revision(data)
