@@ -3391,19 +3391,67 @@ def _migrate_messages_store():
         logger.exception("Migration messages : échec (non bloquant)")
 
 
+# ⚡ CACHES EN LECTURE SEULE (messagerie rapide)
+# --------------------------------------------------------------------
+# Chaque envoi / chaque actualisation relisait ENTIÈREMENT le fichier des
+# messages et le fichier de l'école (plusieurs Mo) : plus il y avait de
+# messages, plus l'envoi d'un parent était lent (délais, envois qui
+# expiraient côté téléphone). Les lectures sans modification utilisent
+# maintenant une copie en mémoire, rechargée dès que le fichier change
+# (date + taille). Les écritures relisent toujours le fichier sous verrou.
+# --------------------------------------------------------------------
+_read_cache_lock = threading.Lock()
+_messages_read_cache = {"sig": None, "data": {}}
+_students_map_cache = {}
+
+
+def _file_sig(path):
+    try:
+        st = os.stat(path)
+        return (st.st_mtime_ns, st.st_size, st.st_ino)
+    except OSError:
+        return None
+
+
+def _read_messages_store():
+    """Copie en mémoire du fichier des messages, POUR LECTURE SEULEMENT
+    (ne jamais modifier l'objet retourné)."""
+    sig = _file_sig(MESSAGES_FILE)
+    if sig is None:
+        return {}
+    with _read_cache_lock:
+        if _messages_read_cache["sig"] == sig:
+            return _messages_read_cache["data"]
+    data = _load_json(MESSAGES_FILE, {})
+    with _read_cache_lock:
+        _messages_read_cache["sig"] = sig
+        _messages_read_cache["data"] = data
+    return data
+
+
 def _school_students_map(school_code):
-    """{ID_ELEVE_MAJ: {nom, postNom, prenom, classe, section}} pour l'école."""
+    """{ID_ELEVE_MAJ: {nom, postNom, prenom, classe, section}} pour l'école
+    (copie en mémoire tant que le fichier de l'école ne change pas)."""
+    fpath = _school_path(school_code)
+    sig = _file_sig(fpath)
+    if sig is None:
+        return {}
+    with _read_cache_lock:
+        hit = _students_map_cache.get(fpath)
+        if hit and hit[0] == sig:
+            return hit[1]
     out = {}
     try:
-        fpath = _school_path(school_code)
-        if not os.path.exists(fpath):
-            return out
         data = _read_school_json(fpath)
         if data is None:
             return out
-        for yd in data.get('history', {}).values():
-            for e in yd.get('eleves', []):
-                sid = (e.get('id') or '').upper()
+        for yd in (data.get('history') or {}).values():
+            if not isinstance(yd, dict):
+                continue
+            for e in yd.get('eleves') or []:
+                if not isinstance(e, dict):
+                    continue
+                sid = str(e.get('id') or '').strip().upper()
                 if sid:
                     out[sid] = {
                         "nom":     e.get('nom', ''),
@@ -3414,6 +3462,9 @@ def _school_students_map(school_code):
                     }
     except Exception:
         logger.exception("_school_students_map : échec")
+        return out
+    with _read_cache_lock:
+        _students_map_cache[fpath] = (sig, out)
     return out
 
 
@@ -3722,7 +3773,7 @@ def notify_parents_of_messages(school_code, entries, reminder=False):
         return
 
     students = _school_students_map(school_code)
-    store    = _load_json(MESSAGES_FILE, {})
+    store    = _read_messages_store()
     msg_list = store.get(school_key, [])
     unread_by_student = {}
     for m in msg_list:
@@ -4174,7 +4225,7 @@ def parent_get_messages():
         if not student_id or not school_code:
             return jsonify({"error": "Paramètres manquants"}), 400
 
-        messages_store   = _load_json(MESSAGES_FILE, {})
+        messages_store   = _read_messages_store()
         msg_list         = messages_store.get(school_code.lower(), [])
         student_messages = [
             _public_message(m) for m in _student_messages(msg_list, student_id)
@@ -4245,7 +4296,7 @@ def parent_conversation():
         before_seq = _int_arg('before_seq')
         limit      = _int_arg('limit', 100, 1, 500)
 
-        store    = _load_json(MESSAGES_FILE, {})
+        store    = _read_messages_store()
         msgs     = _student_messages(store.get(school_code.lower(), []), student_id)
         window, has_more = _slice_conversation(msgs, after_seq, before_seq, limit)
 
@@ -4304,7 +4355,7 @@ def parent_send_message():
             return jsonify({"error": "Élève introuvable"}), 404
 
         # anti-spam : max PARENT_RATE_LIMIT messages / minute / élève
-        store   = _load_json(MESSAGES_FILE, {})
+        store   = _read_messages_store()
         recent  = _student_messages(store.get(school_code.lower(), []), student_id)
         cutoff  = (datetime.datetime.now(datetime.timezone.utc)
                    - datetime.timedelta(minutes=1)).isoformat()
@@ -4387,7 +4438,7 @@ def parent_conversations_summary():
     try:
         data     = request.get_json(silent=True) or {}
         children = _clean_children(data.get('children'))
-        store    = _load_json(MESSAGES_FILE, {})
+        store    = _read_messages_store()
         summaries, total, total_urgent = [], 0, 0
         for c in children:
             msgs = _student_messages(store.get(c['school_code'], []), c['student_id'])
@@ -4395,20 +4446,33 @@ def parent_conversations_summary():
             urgent_unread = _urgent_unread_for_parent(msgs)
             total += unread
             total_urgent += urgent_unread
-            last = max(msgs, key=lambda m: m.get('seq') or 0) if msgs else None
+            ordered = sorted(msgs, key=lambda m: m.get('seq') or 0)
+            last = ordered[-1] if ordered else None
+
+            def _brief(m):
+                return {
+                    "id":         m.get('id', ''),
+                    "client_id":  m.get('client_id'),
+                    "seq":        m.get('seq') or 0,
+                    "type":       m.get('type', 'message'),
+                    "title":      m.get('title', ''),
+                    "text":       _preview(m.get('message'), 120),
+                    "sender":     _sender_of(m),
+                    "read":       bool(m.get('read')),
+                    "created_at": m.get('created_at', ''),
+                }
+
             summaries.append({
                 "school_code":   c['school_code'],
                 "student_id":    c['student_id'],
                 "unread_count":  unread,
                 "urgent_unread": urgent_unread,
                 "last_seq":      (last.get('seq') or 0) if last else 0,
-                "last_message": ({
-                    "type":       last.get('type', 'message'),
-                    "title":      last.get('title', ''),
-                    "text":       _preview(last.get('message'), 120),
-                    "sender":     _sender_of(last),
-                    "created_at": last.get('created_at', ''),
-                } if last else None),
+                "last_message":  _brief(last) if last else None,
+                # ⚡ Les derniers messages (du plus récent au plus ancien) :
+                # si le parent a supprimé le dernier message sur son
+                # téléphone, l'application affiche le précédent.
+                "recent":        [_brief(m) for m in reversed(ordered[-40:])],
             })
         return jsonify({"summaries": summaries, "total_unread": total,
                         "total_urgent_unread": total_urgent}), 200
@@ -4431,7 +4495,7 @@ def school_get_conversations():
         school_code = request.args.get('school_code', '').strip()
         if not school_code:
             return jsonify({"error": "Code manquant"}), 400
-        store    = _load_json(MESSAGES_FILE, {})
+        store    = _read_messages_store()
         msg_list = store.get(school_code.lower(), [])
         students = _school_students_map(school_code)
 
@@ -4483,7 +4547,7 @@ def school_get_conversation():
         before_seq = _int_arg('before_seq')
         limit      = _int_arg('limit', 100, 1, 500)
 
-        store = _load_json(MESSAGES_FILE, {})
+        store = _read_messages_store()
         msgs  = _student_messages(store.get(school_code.lower(), []), student_id)
         window, has_more = _slice_conversation(msgs, after_seq, before_seq, limit)
         return jsonify({
@@ -4597,7 +4661,7 @@ def school_get_sent_messages():
         urgent_only  = _as_bool(request.args.get('urgent_only', '0'))
         pending_only = _as_bool(request.args.get('pending_only', '0'))
 
-        store    = _load_json(MESSAGES_FILE, {})
+        store    = _read_messages_store()
         msg_list = store.get(school_code.lower(), [])
         students = _school_students_map(school_code)
 
@@ -4680,7 +4744,7 @@ def school_get_message_receipts():
         if not school_code or not batch_id:
             return jsonify({"error": "Paramètres manquants"}), 400
 
-        store    = _load_json(MESSAGES_FILE, {})
+        store    = _read_messages_store()
         msg_list = store.get(school_code.lower(), [])
         msgs = [m for m in msg_list
                 if _sender_of(m) != 'parent'
@@ -5114,7 +5178,7 @@ def admin_health():
 
         urgent_pending = 0
         try:
-            msg_store = _load_json(MESSAGES_FILE, {})
+            msg_store = _read_messages_store()
             urgent_pending = sum(
                 1 for lst in msg_store.values() for m in lst
                 if m.get('urgent') and not m.get('read')
