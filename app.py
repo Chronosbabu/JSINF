@@ -1142,14 +1142,82 @@ def _compute_subscription_status(school):
     }
 
 
-def _get_required_for_month(config, section, mois):
-    exceptions = config.get('monthlyExceptionsBySection', {}).get(section, {})
-    if mois in exceptions:
-        return float(exceptions[mois])
-    fee = config.get('feesBySection', {}).get(section)
-    if fee is not None:
-        return float(fee)
-    return 35000.0
+# Montant utilisé par l'application de l'école quand rien n'est configuré
+# (FraisScolaires._montantSecoursSiNonConfigure).
+MONTANT_SECOURS_NON_CONFIGURE = 35000.0
+
+
+def _to_float(value):
+    """Nombre lu dans le JSON de l'école ; None si absent ou illisible."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _get_required_for_month(config, section, mois, classe=None):
+    """Montant requis d'un mois pour une section (et une classe).
+    ⚠️ Copie EXACTE de FraisScolaires.getRequiredForMonth (application de
+    l'école, frais_scolaires.dart) — les deux doivent rester identiques :
+      1. exception de la CLASSE pour ce mois
+      2. frais de la CLASSE
+      3. exception de la SECTION pour ce mois
+      4. frais de la SECTION
+      5. 35 000 si rien n'est configuré
+    La classe est repérée par « section|numéro », le numéro étant le premier
+    mot de la classe complète (« 6 A » → « 6 »)."""
+    config = config if isinstance(config, dict) else {}
+    classe = (classe or '').strip()
+    if classe:
+        key = f"{section}|{classe.split(' ')[0]}"
+        class_exc = (config.get('monthlyExceptionsByClasse') or {}).get(key)
+        if isinstance(class_exc, dict) and mois in class_exc:
+            v = _to_float(class_exc[mois])
+            if v is not None:
+                return v
+        fees_classe = config.get('feesByClasse') or {}
+        if key in fees_classe:
+            v = _to_float(fees_classe[key])
+            if v is not None:
+                return v
+    exc = (config.get('monthlyExceptionsBySection') or {}).get(section)
+    if isinstance(exc, dict) and mois in exc:
+        v = _to_float(exc[mois])
+        if v is not None:
+            return v
+    v = _to_float((config.get('feesBySection') or {}).get(section))
+    if v is not None:
+        return v
+    return MONTANT_SECOURS_NON_CONFIGURE
+
+
+def _required_for_student_month(config, eleve, mois):
+    """Montant requis d'un mois pour UN élève.
+    ⚠️ Copie EXACTE de FraisScolaires.getRequiredForMonthForEleve :
+      1. montant personnalisé de l'élève pour ce mois (négatif → 0)
+      2. montant mensuel personnalisé de l'élève (réduction, bourse…)
+      3. sinon la règle classe / section ci-dessus."""
+    eleve = eleve if isinstance(eleve, dict) else {}
+    perso_mois = eleve.get('exceptionsMoisPersonnalisees') or {}
+    if isinstance(perso_mois, dict) and mois in perso_mois:
+        v = _to_float(perso_mois[mois])
+        if v is not None:
+            return 0.0 if v < 0 else v
+    perso = _to_float(eleve.get('montantMensuelPersonnalise'))
+    if perso is not None:
+        return perso
+    section = eleve.get('section')
+    if section is None:
+        section = 'Primaire'   # même valeur par défaut que Eleve.fromJson
+    return _get_required_for_month(config, section, mois,
+                                   eleve.get('classe') or '')
+
+
+def _required_by_month_for_student(config, eleve):
+    """{mois: montant requis} pour les 10 mois de l'année scolaire."""
+    return {m: _required_for_student_month(config, eleve, m) for m in MONTHS}
 
 
 def _distribute_payment(config, eleve, start_mois, total_amount):
@@ -1157,14 +1225,13 @@ def _distribute_payment(config, eleve, start_mois, total_amount):
     if index == -1:
         return []
 
-    section   = eleve.get('section', '')
     paid_map  = eleve.get('paid', {})
     remaining = float(total_amount)
     entries   = []
 
     while remaining > 0 and index < len(MONTHS):
         current_month = MONTHS[index]
-        required      = _get_required_for_month(config, section, current_month)
+        required      = _required_for_student_month(config, eleve, current_month)
         already_paid  = float(paid_map.get(current_month, 0))
         needed        = required - already_paid
 
@@ -2085,6 +2152,17 @@ def parent_get_payment_history():
                     "fees_by_section":    config.get('feesBySection', {}),
                     "monthly_exceptions": config.get('monthlyExceptionsBySection', {}),
                     "fees_by_classe":     config.get('feesByClasse', {}),
+                    "monthly_exceptions_by_classe":
+                        config.get('monthlyExceptionsByClasse', {}),
+                    # ⚡ Montant requis de CHAQUE mois pour CET élève, calculé
+                    # avec toutes les règles de l'école (montant personnalisé,
+                    # classe, section). L'application parent affiche ces
+                    # montants tels quels : mêmes chiffres que l'école.
+                    "required_by_month":
+                        _required_by_month_for_student(config, e),
+                    "months":             MONTHS,
+                    "classe":             e.get('classe', ''),
+                    "section":            e.get('section', ''),
                     "current_year":       current_year,
                 }), 200
 
