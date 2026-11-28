@@ -26,6 +26,8 @@ from payment_sync import (
 )
 # 📞 APPELS AUDIO — l'école appelle le parent (WebRTC, signalisation seule)
 from voice_calls import register_voice_calls
+# ✍️ « écrit… » dans la messagerie
+from chat_typing import register_chat_typing
 
 app = Flask(__name__)
 
@@ -114,6 +116,7 @@ SYSTEM_FILES = {
     'parent_devices.json',
     'payments_versions.json',   # ⚡ SYNC PAIEMENTS
     'voice_calls.json',         # 📞 APPELS AUDIO
+    'chat_typing.json',         # ✍️ « écrit… »
 }
 
 logging.basicConfig(
@@ -5424,6 +5427,15 @@ _voice_calls = register_voice_calls(app, {
     "add_messages_bulk":            _add_messages_bulk,
     "notify_parents":               notify_parents_of_messages,
     "run_async":                    _run_async,
+})
+
+# ✍️ « écrit… » — routes /chat/typing (POST : je tape ; GET : l'autre tape ?)
+register_chat_typing(app, {
+    "data_dir":          DATA_DIR,
+    "lock_cls":          _ReentrantFileLock,
+    "load_json":         _load_json,
+    "save_json_atomic":  _save_json_atomic,
+    "valid_school_code": _valid_school_code,
 })
 
 _sync_orphan_schools()
