@@ -3786,6 +3786,45 @@ def parent_register_device():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route('/parent/confirm_delivery', methods=['POST'])
+def parent_confirm_delivery():
+    """✓✓ « REÇU » comme WhatsApp : le téléphone du parent a reçu la
+    notification (même application fermée). Les messages de l'école pour
+    ces élèves passent à « reçu » : l'école voit deux coches grises.
+    Corps : school_code, student_ids (liste) ou student_id."""
+    try:
+        data        = request.get_json(silent=True) or {}
+        school_code = (data.get('school_code') or '').strip()
+        raw = data.get('student_ids') or []
+        if isinstance(raw, str):
+            raw = raw.split(',')
+        if data.get('student_id'):
+            raw = list(raw) + [data.get('student_id')]
+        ids = []
+        for x in raw[:MAX_CHILDREN_PER_DEVICE]:
+            sid = str(x or '').strip().upper()
+            if sid and sid not in ids:
+                ids.append(sid)
+        if not _valid_school_code(school_code) or not ids:
+            return jsonify({"error": "Paramètres manquants"}), 400
+
+        msgs = _read_messages_store().get(school_code.lower(), [])
+        marked = 0
+        for sid in ids:
+            seqs = [m.get('seq') or 0 for m in msgs
+                    if (m.get('student_id') or '').upper() == sid
+                    and _sender_of(m) != 'parent'
+                    and not m.get('delivered_at')]
+            if seqs:
+                _mark_delivered(school_code, sid, seqs)
+                marked += len(seqs)
+        return jsonify({"message": "Réception confirmée",
+                        "marked": marked}), 200
+    except Exception as e:
+        logger.exception("Erreur parent_confirm_delivery")
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/parent/unregister_device', methods=['POST'])
 def parent_unregister_device():
     try:
@@ -3908,6 +3947,8 @@ def notify_parents_of_messages(school_code, entries, reminder=False):
             "school_code": school_code,
             "student_id":  matched[0],
             "message_id":  str(ref.get('id', '')),
+            # ✓✓ tous les enfants concernés (le téléphone confirme « reçu »)
+            "student_ids": ",".join(matched[:MAX_CHILDREN_PER_DEVICE]),
             "msg_type":    str(ref.get('type', '')),
             "urgent":      "1" if urgent_any else "0",
             "reminder":    "1" if reminder else "0",
