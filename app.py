@@ -24,6 +24,8 @@ from firebase_admin import credentials, messaging
 from payment_sync import (
     register_payment_sync, get_payment_version, bump_payment_versions,
 )
+# 📞 APPELS AUDIO — l'école appelle le parent (WebRTC, signalisation seule)
+from voice_calls import register_voice_calls
 
 app = Flask(__name__)
 
@@ -111,6 +113,7 @@ SYSTEM_FILES = {
     'fcm_tokens.json',
     'parent_devices.json',
     'payments_versions.json',   # ⚡ SYNC PAIEMENTS
+    'voice_calls.json',         # 📞 APPELS AUDIO
 }
 
 logging.basicConfig(
@@ -5288,6 +5291,7 @@ def admin_health():
             "guard_ratio":     GUARD_RATIO,
             "max_snapshots":   MAX_SNAPSHOTS,
             "admin_password_from_env": bool(os.environ.get("ADMIN_PASSWORD")),
+            "voice_calls":     _voice_calls["health"](),
         }), 200
     except Exception as e:
         logger.exception("Erreur admin_health")
@@ -5352,6 +5356,33 @@ register_payment_sync(app, {
     "read_school":        _read_school_json,
     "commit_school":      _commit_school,
     "pw_equal":           _pw_equal,
+})
+
+
+# 📞 APPELS AUDIO — routes /calls/*, /school/call/*, /parent/call/*
+def _school_display_name(school_code):
+    try:
+        d = _read_school_json(_school_path(school_code))
+        return ((d or {}).get('config') or {}).get('schoolName', '') or ''
+    except Exception:
+        return ''
+
+
+_voice_calls = register_voice_calls(app, {
+    "data_dir":                     DATA_DIR,
+    "lock_cls":                     _ReentrantFileLock,
+    "load_json":                    _load_json,
+    "save_json_atomic":             _save_json_atomic,
+    "valid_school_code":            _valid_school_code,
+    "school_students_map":          _school_students_map,
+    "school_name":                  _school_display_name,
+    "parent_devices":               lambda: _load_json(PARENT_DEVICES_FILE, {}),
+    "firebase_ready":               _firebase_ready,
+    "is_dead_token_error":          _is_dead_token_error,
+    "remove_invalid_parent_tokens": _remove_invalid_parent_tokens,
+    "add_messages_bulk":            _add_messages_bulk,
+    "notify_parents":               notify_parents_of_messages,
+    "run_async":                    _run_async,
 })
 
 _sync_orphan_schools()
