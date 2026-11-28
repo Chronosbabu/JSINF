@@ -324,7 +324,11 @@ def register_voice_calls(app, deps):
                 req = urllib.request.Request(
                     base + suffix, data=body, method="POST",
                     headers={"Authorization": f"Bearer {token}",
-                             "Content-Type": "application/json"})
+                             "Content-Type": "application/json",
+                             "Accept": "application/json",
+                             # Cloudflare refuse (403) l'agent par défaut
+                             # « Python-urllib » : on se présente normalement.
+                             "User-Agent": "EduPay-Server/1.0"})
                 with urllib.request.urlopen(req, timeout=6) as r:
                     payload = json.loads(r.read().decode())
                 ice = payload.get("iceServers")
